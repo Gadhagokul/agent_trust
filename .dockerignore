@@ -1,0 +1,16 @@
+.git
+.gitignore
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tests/
+streamlit_app/
+README.md
+Makefile
+pyproject.toml
+.github/
+.vscode/
+.idea/
