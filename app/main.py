@@ -1,4 +1,5 @@
 # app/main.py
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.v1.router import api_router
 from app.domain.errors import DomainError
@@ -51,13 +53,34 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(RequestContextMiddleware)
+class TimeoutMiddleware:
+    def __init__(self, app: ASGIApp, timeout: int = 30):
+        self.app = app
+        self.timeout = timeout
 
-origins = (
-    ["*"]
-    if get_settings().cors_origins == "*"
-    else [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
-)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            await asyncio.wait_for(self.app(scope, receive, send), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            from fastapi.responses import JSONResponse
+            response = JSONResponse(
+                status_code=504,
+                content={"detail": {"code": "request_timeout", "message": "Request timed out"}},
+            )
+            await response(scope, receive, send)
+
+
+app.add_middleware(RequestContextMiddleware)
+app.add_middleware(TimeoutMiddleware, timeout=30)
+
+cors_origins_str = get_settings().cors_origins
+if cors_origins_str:
+    origins = [o.strip() for o in cors_origins_str.split(",") if o.strip()]
+else:
+    origins = []
 
 app.add_middleware(
     CORSMiddleware,

@@ -32,8 +32,16 @@ class Settings(BaseSettings):
     api_key: str = "change-me-in-production"
     rate_limit_per_minute: int = 120
 
-    # CORS — comma-separated origins in production, "*" in dev/local
-    cors_origins: str = "*"
+    # Database connection pool
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
+    db_pool_timeout: int = 30
+
+    # Rate limiter backend ("memory" | "redis")
+    rate_limiter_backend: str = "redis"
+
+    # CORS — comma-separated origins in production; must be explicitly configured
+    cors_origins: str = ""
 
     # Scoring & Risk Thresholds
     conversion_thresholds: dict = {1: 15, 7: 50, 30: 150, 365: 500}
@@ -59,6 +67,10 @@ class Settings(BaseSettings):
             raise RuntimeError("Database connection settings are incomplete")
         if self.rate_limit_per_minute < 1:
             raise RuntimeError("rate_limit_per_minute must be at least 1")
+        if self.app_env in ("production", "staging") and not self.cors_origins:
+            raise RuntimeError(
+                "CORS_ORIGINS must be configured for production/staging deployment"
+            )
 
 
 @lru_cache(maxsize=1)

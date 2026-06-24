@@ -57,6 +57,6 @@ class AuditRepository:
                 "Audit log saved → Agent %s | %s→%s (%+.2f) | %s→%s",
                 agent_id, old_score, new_score, delta, old_tier, new_tier,
             )
-        except Exception as e:
+        except Exception:
             db.rollback()
-            logger.error("Failed to append Audit Log for Agent %s: %s", agent_id, str(e))
+            logger.exception("Failed to append Audit Log for Agent %s", agent_id)

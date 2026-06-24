@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.domain.errors import (
     DatabaseUnavailableError,
+    ModelUnavailableError,
     SchemaChangedError,
 )
 from app.domain.models import (
@@ -287,8 +288,12 @@ class AgentTrustScorer:
             if is_inactive_overall:
                 ml_calibration_score = financial_score
             else:
-                predictor = TrustModelPredictor()
-                ml_calibration_score = predictor.predict(ml_features)
+                try:
+                    predictor = TrustModelPredictor()
+                    ml_calibration_score = predictor.predict(ml_features)
+                except ModelUnavailableError:
+                    logger.warning("ML model unavailable — falling back to financial score for agent %s", agent_id)
+                    ml_calibration_score = financial_score
 
             # --- 4. Final Trust Score (80% Composite, 20% ML) ---
             overall = int(round((composite_trust * 0.8) + (ml_calibration_score * 0.2)))
@@ -321,8 +326,8 @@ class AgentTrustScorer:
                     old_tier=prev_tier, new_tier=tier, event_type="score_shift",
                     metadata={"trigger": "composite_recalculation"}
                 )
-            except Exception as e:
-                logger.error("Audit logging skipped: %s", str(e))
+            except Exception:
+                logger.exception("Audit logging skipped for agent %s", agent_id_val)
 
             badges = self._determine_badges(
                 overall_score=overall,

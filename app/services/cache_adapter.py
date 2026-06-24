@@ -93,8 +93,8 @@ class CacheAdapter:
         try:
             return self.redis.set(f"{LOCK_PREFIX}{key}", "1", nx=True, ex=LOCK_TTL)
         except Exception as exc:
-            logger.warning("Lock failed for '%s' → proceeding without protection: %s", key, exc)
-            return True  # fail-open
+            logger.error("Lock acquisition failed for '%s': %s", key, exc)
+            raise
 
     def release_lock(self, key: str) -> None:
         try:
@@ -102,11 +102,15 @@ class CacheAdapter:
         except Exception:
             pass
 
-    def wait_for_cache(self, key: str, retries: int = 10, delay: float = 0.05) -> dict | None:
-        """Wait briefly for another request to populate cache"""
-        for _ in range(retries):
+    def wait_for_cache(
+        self, key: str, max_retries: int = 6, initial_delay: float = 0.01
+    ) -> dict | None:
+        """Wait for another request to populate cache using exponential backoff"""
+        delay = initial_delay
+        for _ in range(max_retries):
             time.sleep(delay)
             cached = self.get(key)
             if cached:
                 return cached
+            delay = min(delay * 2, 0.5)
         return None

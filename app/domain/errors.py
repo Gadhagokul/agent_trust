@@ -28,4 +28,10 @@ class DatabaseUnavailableError(DomainError):
 class SchemaChangedError(DomainError):
     """Raised when the external DB schema has changed (missing table or column)."""
     def __init__(self, message: str = "External database schema has changed. Service is degraded."):
-        super().__init__(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, code="schema_changed", message=message)
+        super().__init__(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, code="schema_changed", message=message)
+
+
+class ModelUnavailableError(DomainError):
+    """Raised when the ML model is not loaded or inference fails."""
+    def __init__(self, message: str = "ML model is unavailable for scoring"):
+        super().__init__(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, code="model_unavailable", message=message)
