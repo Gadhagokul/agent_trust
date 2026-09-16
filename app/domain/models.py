@@ -5,49 +5,52 @@ from pydantic import BaseModel, Field
 
 
 class ConversionMetrics(BaseModel):
-    # Search breakdown
-    searches: int                    # Raw total from search_sessions
-    bookstep_failed: int             # BookStep+FAILED (system/payment failures)
-    adjusted_bookstep_failed: int    # Capped at 70% of searches (abuse prevention)
-    other_step_failed: int           # Non-BookStep failures (agent-caused signals)
-    effective_searches: int          # searches - adjusted_bookstep_failed (floor: 1)
-    no_activity: bool = False        # True when effective_searches == 0
-    # Booking outcome
+    searches: int
+    bookstep_failed: int
+    adjusted_bookstep_failed: int
+    other_step_failed: int
+    effective_searches: int
+    no_activity: bool = False
     bookings: int
     booking_volume: float
-    avg_booking_value: float         # Revenue normalization: per-booking average
-    revenue_consistency: float       # Stddev of booking amounts (lower = more stable)         
-    low_confidence: bool=False     # True if effective_searches < 5 (statistically unreliable)
+    avg_booking_value: float
+    revenue_consistency: float
+    low_confidence: bool = False
 
 
 class AgentTrustFeatures(BaseModel):
-    current_credit_delay_days: int = Field(...)
-    unpaid_ratio: float = Field(..., ge=0, le=100)
-    unpaid_count: int = Field(..., ge=0)
+    current_max_delay_days: int = Field(...)
+    current_overdue_ratio: float = Field(..., ge=0, le=100)
+    current_overdue_count: int = Field(..., ge=0)
+    outstanding_amount: float = Field(default=0.0, ge=0)
+    historical_late_payment_count: int = Field(default=0, ge=0)
+    historical_late_payment_ratio: float = Field(default=0.0, ge=0, le=100)
+    average_payment_delay_days: float = Field(default=0.0, ge=0)
     no_activity: bool = False
-    
+
     daily: ConversionMetrics
     weekly: ConversionMetrics
     monthly: ConversionMetrics
     yearly: ConversionMetrics
 
+    # Search-to-Booking (Feature B) — created+reused search intents, 365d
+    search_activity: dict = {}
+
 
 class AgentTrustScores(BaseModel):
-    # Old legacy scores (kept for backwards compatibility during transition if needed)
-    operational_score: int = Field(default=0, ge=0, le=100)   
-    
-    # New Transparent Trust Components
-    reliability_score: float = Field(default=0.0)
+    operational_score: int = Field(default=0, ge=0, le=100)
+
+    reliability_score: float | None = Field(default=None)
     financial_score: float = Field(default=0.0)
     experience_score: float = Field(default=0.0)
-    # Combined Totals
     composite_trust_score: float = Field(default=0.0)
     ml_calibration_score: float = Field(default=0.0)
     overall_score: int = Field(..., ge=0, le=100)
+    # None when the agent has no search behavior data (component excluded)
+    search_to_booking_score: float | None = None
 
 
 class AgentTrustResult(BaseModel):
-    """Domain model returned by Scorer"""
     agent_id: int
     agent_name: str
     features: AgentTrustFeatures

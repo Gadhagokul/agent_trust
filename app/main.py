@@ -1,4 +1,5 @@
 # app/main.py
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -7,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from prometheus_fastapi_instrumentator import Instrumentator
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.v1.router import api_router
 from app.domain.errors import DomainError
@@ -15,6 +16,7 @@ from app.infra.db.session import engine
 from app.infra.redis_provider import get_redis_provider
 from app.infra.settings import get_settings
 from app.observability.logging import configure_logging
+from app.observability.metrics import MetricsMiddleware, metrics_response
 from app.observability.request_context import RequestContextMiddleware
 
 logger = logging.getLogger(__name__)
@@ -26,7 +28,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     app.state.settings = settings
 
-    settings.validate()
+    settings._validate_startup()
 
     logger.info("Service started", extra={"env": settings.app_env, "version": settings.app_version})
 
@@ -51,13 +53,37 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(RequestContextMiddleware)
 
-origins = (
-    ["*"]
-    if get_settings().cors_origins == "*"
-    else [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
-)
+class TimeoutMiddleware:
+    def __init__(self, app: ASGIApp, timeout: int = 30):
+        self.app = app
+        self.timeout = timeout
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            await asyncio.wait_for(self.app(scope, receive, send), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            from fastapi.responses import JSONResponse
+
+            response = JSONResponse(
+                status_code=504,
+                content={"detail": {"code": "request_timeout", "message": "Request timed out"}},
+            )
+            await response(scope, receive, send)
+
+
+app.add_middleware(RequestContextMiddleware)
+app.add_middleware(TimeoutMiddleware, timeout=30)
+app.add_middleware(MetricsMiddleware)
+
+cors_origins_str = get_settings().cors_origins
+if cors_origins_str:
+    origins = [o.strip() for o in cors_origins_str.split(",") if o.strip()]
+else:
+    origins = []
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,8 +93,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Instrument the app before returning/startup to prevent middleware modification errors
-Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+
+# Expose Prometheus metrics
+@app.get("/metrics")
+def metrics():
+    return metrics_response()
+
 
 app.include_router(api_router)
 

@@ -13,12 +13,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
 
-COPY app/ ./app/
-COPY scripts/ ./scripts/
-COPY .env ./.env
+COPY --from=builder --chown=appuser:appuser /root/.local /home/appuser/.local
+ENV PATH=/home/appuser/.local/bin:$PATH
+
+COPY --chown=appuser:appuser app/ ./app/
+COPY --chown=appuser:appuser scripts/ ./scripts/
+
+USER appuser
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

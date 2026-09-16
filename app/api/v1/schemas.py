@@ -15,6 +15,7 @@ class DomainEventType(str, Enum):
     CREDIT_DEFAULTED = "credit_defaulted"
     CREDIT_REPAID = "credit_repaid"
 
+
 class DomainEventPayload(BaseModel):
     agent_id: int
     event_type: DomainEventType
@@ -31,3 +32,34 @@ class AgentTrustScoreResponse(BaseModel):
     high_risk_flag: bool
     high_risk_reasons: list[str] = Field(default_factory=list)
     calculated_at: str
+
+
+class SupplierQuotaStatus(BaseModel):
+    code: str
+    name: str
+    is_active: bool
+    health_status: str
+    search_limit: int
+    minimum_booking: int
+    consumed: int
+    remaining: int
+    status: str  # unused | available | exhausted | monitoring_only
+    available_to_search: bool
+
+
+class SupplierQuotaStatusResponse(BaseModel):
+    period_type: str
+    period_days: int
+    computed_at: str
+    suppliers: list[SupplierQuotaStatus]
+
+
+class AdminTrustScoreItem(AgentTrustScoreResponse):
+    establishment_name: str = ""
+
+
+class AdminTrustScoreListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: list[AdminTrustScoreItem]

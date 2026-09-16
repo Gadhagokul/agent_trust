@@ -57,3 +57,25 @@ class TestOpenApiDocs:
         paths = response.json()["paths"]
         assert "/v1/health/live" in paths
         assert "/v1/health/ready" in paths
+
+    def test_supplier_quota_endpoints_documented(self, client):
+        response = client.get("/openapi.json")
+        paths = response.json()["paths"]
+        assert "/v1/suppliers/quota-status" in paths
+        assert "/v1/suppliers/{code}/quota-status" in paths
+
+    def test_trust_score_schema_includes_search_to_booking(self, client):
+        response = client.get("/openapi.json")
+        schema = response.json()
+        scores_schema = schema["components"]["schemas"]["AgentTrustScores"]
+        features_schema = schema["components"]["schemas"]["AgentTrustFeatures"]
+        assert "search_to_booking_score" in scores_schema["properties"]
+        assert "search_activity" in features_schema["properties"]
+
+    def test_supplier_quota_schema(self, client):
+        response = client.get("/openapi.json")
+        schema = response.json()["components"]["schemas"]
+        supplier = schema["SupplierQuotaStatus"]["properties"]
+        assert "available_to_search" in supplier
+        assert "consumed" in supplier
+        assert "search_limit" in supplier

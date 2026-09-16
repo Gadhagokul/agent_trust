@@ -1,28 +1,30 @@
+import hmac
+
 from fastapi import Depends, HTTPException, status
-from fastapi.security import APIKeyHeader
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.infra.settings import get_settings
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+service_token_scheme = HTTPBearer(auto_error=False)
 
 
 class Principal:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
+    def __init__(self, service_token: str):
+        self.service_token = service_token
 
 
 def get_current_principal(
-    api_key: str = Depends(api_key_header),
+    credentials: HTTPAuthorizationCredentials | None = Depends(service_token_scheme),
 ) -> Principal:
     settings = get_settings()
 
-    # Bypass in development for easier testing
-    if settings.app_env in ("development", "local"):
-        return Principal(api_key=api_key or "dev-key")
+    token = credentials.credentials if credentials is not None else ""
+    expected = settings.laravel_service_token
 
-    if not api_key or api_key != settings.api_key:
+    if not token or not hmac.compare_digest(token, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API Key",
+            detail="Invalid service token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    return Principal(api_key=api_key)
+    return Principal(service_token=token)

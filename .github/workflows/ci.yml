@@ -81,7 +81,7 @@ jobs:
           DB_USERNAME: test_user
           DB_PASSWORD: test_pass
           REDIS_URL: redis://127.0.0.1:6379/0
-          API_KEY: test-api-key
+          LARAVEL_SERVICE_TOKEN: test-service-token-0123456789abcdef
           LOG_LEVEL: CRITICAL
 
   docker-build:
