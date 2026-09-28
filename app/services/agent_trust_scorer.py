@@ -18,15 +18,58 @@ from app.domain.models import (
     AgentTrustResult,
     AgentTrustScores,
     ConversionMetrics,
+    ReliabilityDetail,
 )
 from app.infra.db.audit_repository import AuditRepository
 from app.infra.db.repository import AgentRepository, CreditStats
 from app.infra.settings import get_settings
 from app.ml.trust_model import TrustModelPredictor
-from app.observability.metrics import AGENT_TRUST_DURATION, AGENT_TRUST_REQUESTS
+from app.observability.metrics import (
+    AGENT_TRUST_DURATION,
+    AGENT_TRUST_REQUESTS,
+    COMPONENT_UNAVAILABLE,
+)
 from app.services.cache_adapter import CacheAdapter
 
 logger = logging.getLogger(__name__)
+
+
+def wilson_lower_bound(successes: int, trials: int, z: float) -> float | None:
+    """
+    Lower bound of the Wilson score interval for a binomial proportion.
+
+    The plain rate is an over-estimate of the true rate when the sample is tiny:
+    1/1 successes yields exactly 1.0, which claims certainty from a single
+    observation. The Wilson lower bound stays below the observed rate and rises
+    toward it as evidence accumulates, so a new agent cannot look perfect on one
+    booking.
+
+    z is the normal quantile for the one-sided confidence level; 1.96 ~= 95%.
+    Returns None when there is no evidence (trials <= 0).
+    """
+    if trials <= 0:
+        return None
+    p = successes / trials
+    z2 = z * z
+    denom = 1.0 + z2 / trials
+    centre = p + z2 / (2 * trials)
+    margin = z * math.sqrt((p * (1.0 - p) + z2 / (4.0 * trials)) / trials)
+    return max(0.0, (centre - margin) / denom)
+
+
+def prior_weight(trials: int, min_observations: int) -> float:
+    """
+    How far the estimate is pulled toward the prior.
+
+    Exactly 0 at or above min_observations, so an established agent's estimate
+    is never shrunk. This is the quantity `confidence` is defined against:
+    confidence == 1 - prior_weight.
+    """
+    if min_observations < 1:
+        return 0.0
+    if trials <= 0:
+        return 1.0
+    return max(0.0, 1.0 - (trials / min_observations))
 
 
 class AgentTrustScorer:
@@ -133,24 +176,86 @@ class AgentTrustScorer:
 
         return len(reasons) > 0, reasons
 
-    def _compute_reliability_score(self, batch_stats: dict, exp_stats: dict) -> float | None:
+    def _reliability_detail(
+        self,
+        *,
+        successes: int,
+        trials: int,
+        prior_rate: float,
+        z: float,
+        min_observations: int,
+        score: float,
+        confidence_applied: bool,
+    ) -> ReliabilityDetail:
+        """
+        Build the small-sample evidence record for one reliability sub-component.
+
+        This never decides the score -- the caller does. It is computed on every
+        request even while confidence is disabled so the activation review has
+        the would-be Wilson bound, prior weight and confidence to hand, without
+        having to enable anything and re-run production.
+        """
+        w = prior_weight(trials, min_observations)
+        wilson = wilson_lower_bound(successes, trials, z)
+        if trials <= 0:
+            return ReliabilityDetail(
+                n=0,
+                successes=0,
+                raw_rate=None,
+                wilson_lower_bound=None,
+                prior_weight=w,
+                adjusted_rate=None,
+                confidence=max(0.0, 1.0 - w),
+                score=score,
+                no_evidence=True,
+                confidence_applied=confidence_applied,
+            )
+        raw_rate = successes / trials
+        adjusted = wilson if wilson is None else ((1.0 - w) * wilson + w * prior_rate)
+        return ReliabilityDetail(
+            n=trials,
+            successes=successes,
+            raw_rate=raw_rate,
+            wilson_lower_bound=wilson,
+            prior_weight=w,
+            adjusted_rate=adjusted,
+            confidence=max(0.0, 1.0 - w),
+            score=score,
+            no_evidence=False,
+            confidence_applied=confidence_applied,
+        )
+
+    def _compute_reliability_score(
+        self, batch_stats: dict, exp_stats: dict
+    ) -> tuple[float | None, dict[str, ReliabilityDetail] | None]:
         """
         Reliability V3:
         64.3% Booking Success Rate
         35.7% Cancellation Quality (Inverse)
 
-        Attribution (senior §6.2/§7): the denominator counts booking attempts
-        (bookings + agent-attributable BookStep failures), never searches.
-        Excluding technical/outage failures from the attempt base and
-        excluding non-agent cancellations from the cancellation base is
-        config-driven via non_agent_failure_reasons / non_agent_cancellation_reasons
-        (empty = every failure/cancellation attributed to the agent). Applying
-        those lists awaits confirmation of a failure/cancellation reason column.
+        Returns (score, detail). The score is None (component excluded) when the
+        agent has no booking behavior evidence at all, so the composite
+        renormalizes over active parts. Detail is always populated when the
+        score is not None, so the raw rate stays auditable either way.
 
-        Refund, Supplier, and SLA were removed as placeholder components (no real data);
-        weights in reliability_component_weights are renormalized when re-added.
-        Returns None (component excluded) when the agent has no booking
-        behavior evidence, so the composite renormalizes over active parts.
+        Attribution (senior sec6.2/7) is NOT satisfied today, and this method
+        must not appear to satisfy it. non_agent_failure_reasons and
+        non_agent_cancellation_reasons are declared in settings but wired to
+        nothing: the booking data has no confirmed failure/cancellation reason
+        field, so
+          * bookstep_failed counts EVERY BookStep failure (outage, timeout,
+            supplier-side and agent-caused alike), and
+          * lifetime_cancelled counts EVERY bookings.status = 'cancelled' row
+            (repository.get_experience_stats), including airline, supplier,
+            schedule-change and involuntary cancellations.
+        Both are attributed to the agent. Note `adjusted_bookstep_failed` is NOT
+        an attribution adjustment: it is int(min(bookstep_failed, searches * 0.7)),
+        a search-volume cap. Do not substitute it here -- that would silently
+        change the attempt denominator.
+
+        Small-sample confidence (senior sec6.3) therefore adjusts the two rates
+        independently and ships disabled. When a switch is off, the score
+        arithmetic below is left byte-identical to the pre-A1 code.
         """
         settings = get_settings()
         stats = batch_stats.get(365, {})
@@ -174,7 +279,54 @@ class AgentTrustScorer:
             cancel_quality_score = max(0.0, (1.0 - cancel_rate) * 100.0)
 
         if total_attempts == 0 and total_transactions == 0:
-            return None
+            return None, None
+
+        z = settings.reliability_wilson_z
+        min_obs = settings.reliability_min_observations
+
+        # Both sub-components are "successes out of trials, higher is better":
+        # booking success counts the bookings, cancellation quality counts the
+        # NON-cancelled bookings, so a good agent is rewarded either way.
+        booking_detail = self._reliability_detail(
+            successes=bookings,
+            trials=total_attempts,
+            prior_rate=settings.reliability_success_prior_rate,
+            z=z,
+            min_observations=min_obs,
+            score=success_score,
+            confidence_applied=False,
+        )
+        cancel_detail = self._reliability_detail(
+            successes=lifetime_bookings,
+            trials=total_transactions,
+            prior_rate=settings.reliability_cancellation_prior_rate,
+            z=z,
+            min_observations=min_obs,
+            score=cancel_quality_score,
+            confidence_applied=False,
+        )
+
+        # Substitute the confidence-adjusted rate only where a switch is on and
+        # there is evidence. The legacy expressions above are never rewritten, so
+        # a disabled deployment is arithmetically identical to before A1.
+        if settings.reliability_confidence_enabled and booking_detail.adjusted_rate is not None:
+            success_score = booking_detail.adjusted_rate * 100.0
+            booking_detail = booking_detail.model_copy(
+                update={"score": success_score, "confidence_applied": True}
+            )
+        if (
+            settings.reliability_cancellation_confidence_enabled
+            and cancel_detail.adjusted_rate is not None
+        ):
+            cancel_quality_score = cancel_detail.adjusted_rate * 100.0
+            cancel_detail = cancel_detail.model_copy(
+                update={"score": cancel_quality_score, "confidence_applied": True}
+            )
+
+        detail = {
+            "booking_success": booking_detail,
+            "cancellation_quality": cancel_detail,
+        }
 
         weights = settings.reliability_component_weights
         weight_sum = sum(weights.values())
@@ -183,7 +335,7 @@ class AgentTrustScorer:
             "cancellation_quality": cancel_quality_score,
         }
         reliability = sum(component_scores[k] * w for k, w in weights.items()) / weight_sum
-        return round(reliability, 2)
+        return round(reliability, 2), detail
 
     def _compute_financial_score(self, credit_stats: CreditStats) -> float:
         score = 100.0 - credit_stats.current_overdue_ratio
@@ -450,7 +602,11 @@ class AgentTrustScorer:
             supplier_bookings = self.repository.get_agent_booking_counts_by_provider(db, agent_id)
 
             # --- 1. Compute Transparent Business Components ---
-            reliability_score = self._compute_reliability_score(batch_stats, exp_stats)
+            reliability_score, reliability_detail = self._compute_reliability_score(
+                batch_stats, exp_stats
+            )
+            if reliability_score is None:
+                COMPONENT_UNAVAILABLE.labels(component="reliability").inc()
             financial_score = self._compute_financial_score(credit_stats)
             experience_score = self._compute_experience_score(exp_stats)
             booking_behavior_score, l2b_detail = self._compute_supplier_l2b_component(
@@ -559,6 +715,20 @@ class AgentTrustScorer:
                         "l2b_unconfigured_suppliers": l2b_detail.get(
                             "unconfigured_suppliers", []
                         ),
+                        "reliability_detail": (
+                            {
+                                name: detail.model_dump(mode="json")
+                                for name, detail in reliability_detail.items()
+                            }
+                            if reliability_detail
+                            else None
+                        ),
+                        "reliability_confidence_enabled": (
+                            get_settings().reliability_confidence_enabled
+                        ),
+                        "reliability_cancellation_confidence_enabled": (
+                            get_settings().reliability_cancellation_confidence_enabled
+                        ),
                     },
                 )
             except Exception:
@@ -606,6 +776,7 @@ class AgentTrustScorer:
                     ml_calibration_score=ml_calibration_score,
                     overall_score=overall,
                     search_to_booking_score=booking_behavior_score,
+                    reliability_detail=reliability_detail,
                 ),
                 tier=tier,
                 badges=badges,

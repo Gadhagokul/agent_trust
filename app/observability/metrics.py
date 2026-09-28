@@ -33,6 +33,15 @@ AGENT_TRUST_LATENCY: Histogram = Histogram(
 
 AGENT_TRUST_DURATION: Histogram = AGENT_TRUST_LATENCY
 
+# --- Component evidence (senior sec5: a component with no evidence is excluded
+# from the composite, not scored as 0) ---
+
+COMPONENT_UNAVAILABLE: Counter = Counter(
+    "agent_trust_component_unavailable_total",
+    "Component excluded from the composite for lack of evidence",
+    ["component"],
+)
+
 # --- ML Target Programme (Sprint 5, senior sec15-16) ---
 # Counters are defined ALWAYS but only increment while the ML gate is enabled,
 # so a disabled system still shows NOT_READY/first-predict transitions clearly.

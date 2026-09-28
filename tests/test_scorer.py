@@ -343,42 +343,51 @@ class TestComputeReliabilityScore:
     def test_no_activity_is_excluded(self, scorer):
         batch = {365: {"bookings": 0, "bookstep_failed": 0}}
         exp = {"lifetime_cancelled": 0, "lifetime_bookings": 0}
-        score = scorer._compute_reliability_score(batch, exp)
+        score, detail = scorer._compute_reliability_score(batch, exp)
         assert score is None
+        assert detail is None
 
     def test_all_bookings_successful(self, scorer):
         batch = {365: {"bookings": 100, "bookstep_failed": 0}}
         exp = {"lifetime_cancelled": 0, "lifetime_bookings": 100}
-        score = scorer._compute_reliability_score(batch, exp)
+        score, _ = scorer._compute_reliability_score(batch, exp)
         assert score == 100.0
 
     def test_mixed_existing_bookings_reliability_100(self, scorer):
         batch = {365: {"bookings": 10, "bookstep_failed": 0}}
         exp = {"lifetime_cancelled": 0, "lifetime_bookings": 0}
-        assert scorer._compute_reliability_score(batch, exp) == 100.0
+        score, _ = scorer._compute_reliability_score(batch, exp)
+        assert score == 100.0
 
     def test_high_cancellation_rate(self, scorer):
         batch = {365: {"bookings": 50, "bookstep_failed": 0}}
         exp = {"lifetime_cancelled": 50, "lifetime_bookings": 50}
-        score = scorer._compute_reliability_score(batch, exp)
+        score, _ = scorer._compute_reliability_score(batch, exp)
         expected = round(0.6429 * 100.0 + 0.3571 * 50.0, 2)
         assert score == expected
         assert score < 88.0
 
     def test_weights_renormalize_over_configured_sum(self, scorer, monkeypatch):
         fake = SimpleNamespace(
-            reliability_component_weights={"booking_success": 0.5, "cancellation_quality": 0.5}
+            reliability_component_weights={"booking_success": 0.5, "cancellation_quality": 0.5},
+            reliability_confidence_enabled=False,
+            reliability_cancellation_confidence_enabled=False,
+            reliability_wilson_z=1.96,
+            reliability_min_observations=30,
+            reliability_success_prior_rate=0.5,
+            reliability_cancellation_prior_rate=0.5,
         )
         monkeypatch.setattr("app.services.agent_trust_scorer.get_settings", lambda: fake)
         batch = {365: {"bookings": 100, "bookstep_failed": 0}}
         exp = {"lifetime_cancelled": 50, "lifetime_bookings": 50}
         # 0.5*100 + 0.5*50 = 75.0 (no renormalization drift with two weights)
-        assert scorer._compute_reliability_score(batch, exp) == 75.0
+        score, _ = scorer._compute_reliability_score(batch, exp)
+        assert score == 75.0
 
     def test_cancellation_quality_mirrors_implementation(self, scorer):
         batch = {365: {"bookings": 1, "bookstep_failed": 0}}
         exp = {"lifetime_cancelled": 100, "lifetime_bookings": 1}
-        score = scorer._compute_reliability_score(batch, exp)
+        score, _ = scorer._compute_reliability_score(batch, exp)
         # cancel quality = (1 - 100/101)*100 = 0.99; clamp is defensive only
         cancel_rate = 100.0 / 101.0
         cancel_quality = max(0.0, (1.0 - cancel_rate) * 100.0)

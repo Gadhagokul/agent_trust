@@ -171,6 +171,38 @@ class Settings(BaseSettings):
         "cancellation_quality": 0.3571,
     }
 
+    # --- Small-sample confidence (senior sec6.3) ---
+    # A brand-new agent with 1 booking from 1 attempt currently scores 100.0 on
+    # booking success, so it can reach composite 100 on almost no evidence. These
+    # switches apply a Wilson lower bound plus shrinkage toward a prior, and both
+    # ship DISABLED: enabling them changes published scores, so activation is a
+    # config change made after reviewing the before/after score distribution.
+    #
+    # Each sub-component has its OWN switch on purpose, because the two inputs do
+    # not have the same data quality:
+    #   * booking_success  -> bookstep_failed, the raw BookStep failure count.
+    #   * cancellation_quality -> lifetime_cancelled, the raw count of every
+    #     bookings.status = 'cancelled' row.
+    # Both attribution lists (non_agent_failure_reasons,
+    # non_agent_cancellation_reasons) are DECLARED BUT UNWIRED -- nothing in
+    # app/infra/db/repository.py filters on a reason column, because the booking
+    # data has no confirmed failure/cancellation reason field. Every failure and
+    # every cancellation is therefore currently attributed to the agent.
+    # Confidence adjustment does not make attribution worse, but it also does not
+    # fix it, and it must not be read as satisfying the attribution requirement.
+    reliability_confidence_enabled: bool = False
+    # Activation additionally waits on the cancellation-reason field: a
+    # confidence score over unattributed cancellations lends false precision to a
+    # number we cannot yet defend.
+    reliability_cancellation_confidence_enabled: bool = False
+    # z for the Wilson lower bound. 1.96 ~= a 95% one-sided interval.
+    reliability_wilson_z: float = 1.96
+    # At or above this many observations the prior weight is exactly 0, so an
+    # established agent's estimate is never shrunk.
+    reliability_min_observations: int = 30
+    reliability_success_prior_rate: float = 0.5
+    reliability_cancellation_prior_rate: float = 0.5
+
     # Audit log file path
     audit_log_path: str = "logs/agent_score_audits.log"
 
@@ -266,6 +298,21 @@ class Settings(BaseSettings):
             raise RuntimeError("conversion_thresholds must be non-empty")
         if any(int(v) < 1 for v in self.conversion_thresholds.values()):
             raise RuntimeError("conversion_thresholds values must be at least 1")
+        if self.reliability_wilson_z <= 0:
+            raise RuntimeError(
+                "reliability_wilson_z must be > 0, got " f"{self.reliability_wilson_z}"
+            )
+        if self.reliability_min_observations < 1:
+            raise RuntimeError(
+                "reliability_min_observations must be >= 1, got "
+                f"{self.reliability_min_observations}"
+            )
+        for name, prior in (
+            ("reliability_success_prior_rate", self.reliability_success_prior_rate),
+            ("reliability_cancellation_prior_rate", self.reliability_cancellation_prior_rate),
+        ):
+            if not 0 < prior < 1:
+                raise RuntimeError(f"{name} must be strictly between 0 and 1, got {prior}")
 
 
 @lru_cache(maxsize=1)

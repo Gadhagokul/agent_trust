@@ -38,6 +38,34 @@ class AgentTrustFeatures(BaseModel):
     search_activity: dict = {}
 
 
+class ReliabilityDetail(BaseModel):
+    """
+    Per-sub-component small-sample evidence (senior sec6.3).
+
+    raw_rate is the legacy score/100 and is the regression anchor: with
+    confidence disabled this object still reports it, and the component score is
+    arithmetically identical to the pre-A1 behaviour.
+
+    confidence is an EVIDENCE-COMPLETENESS INDICATOR in [0, 1] -- not a
+    probability, not a P-value, and not an interval level. It is exactly
+    1 - prior_weight = min(1, n / min_observations), so it can never disagree
+    with the shrinkage actually applied. 1.0 means the evidence threshold was
+    met, the prior weight is 0, and adjusted_rate == wilson_lower_bound. The
+    interval level is carried separately by reliability_wilson_z.
+    """
+
+    n: int = Field(..., ge=0)
+    successes: int = Field(..., ge=0)
+    raw_rate: float | None = None
+    wilson_lower_bound: float | None = None
+    prior_weight: float = Field(..., ge=0.0, le=1.0)
+    adjusted_rate: float | None = None
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    score: float
+    no_evidence: bool = False
+    confidence_applied: bool = False
+
+
 class AgentTrustScores(BaseModel):
     operational_score: int = Field(default=0, ge=0, le=100)
 
@@ -49,6 +77,10 @@ class AgentTrustScores(BaseModel):
     overall_score: int = Field(..., ge=0, le=100)
     # None when the agent has no search behavior data (component excluded)
     search_to_booking_score: float | None = None
+    # Per-sub-component small-sample evidence; None while confidence is disabled
+    # is NOT implied -- populated whenever reliability is computable, so the raw
+    # rate stays auditable.
+    reliability_detail: dict[str, ReliabilityDetail] | None = None
 
 
 class AgentTrustResult(BaseModel):
