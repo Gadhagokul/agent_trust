@@ -125,8 +125,11 @@ class AgentTrustScorer:
                 f"Outstanding overdue invoice count ({credit_stats.current_overdue_count}) exceeds "
                 f"{settings.credit_max_overdue_count}"
             )
-        if credit_stats.consecutive_unpaid_cycles >= 3:
-            reasons.append("Defaulted on the last 3 consecutive credit cycles")
+        if credit_stats.consecutive_unpaid_cycles >= settings.credit_max_consecutive_overdue_cycles:
+            reasons.append(
+                f"Defaulted on the last {settings.credit_max_consecutive_overdue_cycles} "
+                "consecutive credit cycles"
+            )
 
         return len(reasons) > 0, reasons
 
@@ -136,7 +139,15 @@ class AgentTrustScorer:
         64.3% Booking Success Rate
         35.7% Cancellation Quality (Inverse)
 
-        Refund, Supplier, and SLA were removed as placeholders (no real data);
+        Attribution (senior §6.2/§7): the denominator counts booking attempts
+        (bookings + agent-attributable BookStep failures), never searches.
+        Excluding technical/outage failures from the attempt base and
+        excluding non-agent cancellations from the cancellation base is
+        config-driven via non_agent_failure_reasons / non_agent_cancellation_reasons
+        (empty = every failure/cancellation attributed to the agent). Applying
+        those lists awaits confirmation of a failure/cancellation reason column.
+
+        Refund, Supplier, and SLA were removed as placeholder components (no real data);
         weights in reliability_component_weights are renormalized when re-added.
         Returns None (component excluded) when the agent has no booking
         behavior evidence, so the composite renormalizes over active parts.
@@ -197,26 +208,25 @@ class AgentTrustScorer:
         age_score = min(50, math.log1p(max(0, days_active)) * 6.7)
         return round(booking_score + age_score, 2)
 
-    def _compute_booking_behavior_score(self, activity: dict, target_ratio: float) -> float | None:
+    def _score_l2b_for_target(self, activity: dict, target_ratio: float | None) -> float | None:
         """
-        Agent Search-to-Booking component (Feature B).
+        Shared Search-to-Booking scoring curve (senior §13).
 
-        Searches = every search intent the agent used (created + reused access
-        rows), and bookings = successful bookings, both over the same 365-day
-        window. The target ratio is derived from suppliers (Σ minimum_booking /
-        Σ search_limit, currently 0.05 = 20:1). Meeting the target ratio equals
+        Compares an observed bookings/searches ratio (0-1) against a benchmark
+        target_ratio and returns a 0-100 score. Meeting the target ratio equals
         the minimum acceptable score (default 80); the score rises linearly to
-        100 at `excellent_multiplier` x the target ratio (default 4x = 20%).
+        100 at `excellent_multiplier` x the target. Used both for the aggregate
+        agent metric (Search-to-Booking component, Feature B) and per-supplier
+        compliance under the supplier-specific L2B model.
 
-        Returns None (component excluded) when the agent has no search behavior
-        data or no executable target — in that case the composite is
-        renormalized over the active components.
+        Returns None (component excluded) when there is no search activity or no
+        executable target - the composite then renormalizes over active parts.
         """
         settings = get_settings()
         searches = activity.get("searches", 0)
         bookings = activity.get("bookings", 0)
 
-        if not searches or target_ratio <= 0:
+        if not searches or target_ratio is None or target_ratio <= 0:
             return None
 
         ratio = bookings / searches
@@ -235,6 +245,156 @@ class AgentTrustScorer:
             (base - settings.search_to_booking_neutral_score) * confidence
         )
         return round(max(0.0, min(100.0, score)), 2)
+
+    def _compute_booking_behavior_score(
+        self, activity: dict, target_ratio: float | None
+    ) -> float | None:
+        """
+        Agent Search-to-Booking component (Feature B).
+
+        Searches = every search intent the agent used (created + reused access
+        rows), and bookings = successful bookings, both over the same 365-day
+        window. The benchmark target is derived per supplier from
+        suppliers.minimum_booking / search_limit (site-level) and combined per
+        supplier; the scoring curve itself lives in _score_l2b_for_target.
+
+        Returns None (component excluded) when the agent has no search behavior
+        data or no executable target - in that case the composite is
+        renormalized over the active components.
+        """
+        return self._score_l2b_for_target(activity, target_ratio)
+
+    def _compute_supplier_l2b_component(
+        self,
+        supplier_targets: list[dict],
+        supplier_searches: list[dict],
+        booking_counts: list[dict],
+    ) -> tuple[float | None, dict]:
+        """
+        Supplier-specific Search-to-Booking (L2B) component (senior §10-13).
+
+        Every supplier the agent searched gets its own ratio
+        (bookings_s / searches_s) benchmarked against the SITE-level target from
+        suppliers.minimum_booking / search_limit. The component is the
+        share-weighted mean of per-supplier scores, where share = that
+        supplier's search volume / total volume across configured suppliers.
+        No single supplier may dominate: shares above l2b_max_supplier_share are
+        capped and the excess redistributed proportionally over the rest
+        (senior §13; single-pass is exact because at most one supplier can
+        exceed 50% of a set that sums to 1).
+
+        Aggregation detail confirmed from real data: one session queries all the
+        suppliers the agent selected, so the same access_count legitimately
+        counts toward every supplier with a search_supplier_runs row.
+
+        Unconfigured suppliers (no executable target) are excluded
+        (l2b_not_configured_policy = "exclude", senior §13) - they are never
+        assigned an invented compliance score. If no supplier is configured the
+        component is None and the composite renormalizes (senior §5).
+        """
+        settings = get_settings()
+        target_by_code = {t["code"]: t for t in supplier_targets}
+        bookings_by_provider = {b["provider"]: b["bookings"] for b in booking_counts}
+        searched_codes = [s["code"] for s in supplier_searches]
+
+        configured = []
+        for item in supplier_searches:
+            code = item["code"]
+            target = target_by_code.get(code)
+            if target is None or target.get("target") is None:
+                continue
+            if item.get("searches", 0) <= 0:
+                continue
+            searches = item["searches"]
+            bookings = bookings_by_provider.get(target.get("name") or "", 0)
+            per_supplier_score = self._score_l2b_for_target(
+                {"searches": searches, "bookings": bookings}, target["target"]
+            )
+            if per_supplier_score is None:
+                continue
+            configured.append(
+                {
+                    "code": code,
+                    "name": target.get("name"),
+                    "searches": searches,
+                    "bookings": bookings,
+                    "target": target["target"],
+                    "ratio": round(bookings / searches, 6),
+                    "score": per_supplier_score,
+                }
+            )
+
+        unconfigured = sorted(
+            set(searched_codes) - {c["code"] for c in configured}
+        )
+
+        if not configured:
+            return None, {
+                "supplier_scores": [],
+                "unconfigured_suppliers": unconfigured,
+                "policy": settings.l2b_not_configured_policy,
+                "component": None,
+            }
+
+        total_searches = sum(c["searches"] for c in configured)
+        shares = [c["searches"] / total_searches for c in configured]
+        cap = settings.l2b_max_supplier_share
+
+        if len(configured) > 1:
+            over_indices = [i for i, share in enumerate(shares) if share > cap]
+            if over_indices:
+                excess = sum(shares[i] - cap for i in over_indices)
+                kept_indices = [i for i in range(len(shares)) if i not in over_indices]
+                kept_total = sum(shares[i] for i in kept_indices)
+                for i in over_indices:
+                    shares[i] = cap
+                if kept_total > 0:
+                    for i in kept_indices:
+                        shares[i] += excess * (shares[i] / kept_total)
+
+        share_sum = sum(shares)
+        normalized = [share / share_sum for share in shares]
+        component = round(
+            sum(share * c["score"] for share, c in zip(normalized, configured, strict=True)),
+            2,
+        )
+
+        detail = {
+            "supplier_scores": [
+                {
+                    "code": c["code"],
+                    "name": c["name"],
+                    "searches": c["searches"],
+                    "bookings": c["bookings"],
+                    "target": c["target"],
+                    "ratio": c["ratio"],
+                    "share": round(share, 6),
+                    "score": c["score"],
+                }
+                for share, c in zip(normalized, configured, strict=True)
+            ],
+            "unconfigured_suppliers": unconfigured,
+            "policy": settings.l2b_not_configured_policy,
+            "component": component,
+        }
+        return component, detail
+
+    def _combine_composite(
+        self, component_scores: dict[str, float | None], weights: dict[str, float]
+    ) -> tuple[float, dict[str, float], list[str], list[str]]:
+        """
+        Missing-data redistribution (senior §5 / §14). Components that cannot be
+        calculated (None) are excluded and their weight is redistributed
+        proportionally among the available components. Returns
+        (composite, weights_used, available_components, unavailable_components)
+        so the effective weights actually used are explicit and auditable.
+        """
+        parts = {k: v for k, v in component_scores.items() if v is not None}
+        unavailable = [k for k in component_scores if k not in parts]
+        weight_sum = sum(weights[k] for k in parts)
+        weights_used = {k: round(weights[k] / weight_sum, 4) for k in parts}
+        composite = sum(weights[k] * parts[k] for k in parts) / weight_sum
+        return round(composite, 2), weights_used, list(parts), unavailable
 
     def _determine_badges(
         self,
@@ -285,36 +445,34 @@ class AgentTrustScorer:
             batch_stats = self.repository.get_multi_timeframe_stats(db, agent_id)
             exp_stats = self.repository.get_experience_stats(db, agent_id)
             search_activity = self.repository.get_agent_search_activity(db, agent_id)
-            target_ratio = self.repository.get_supplier_expected_ratio(db)
+            supplier_targets = self.repository.get_supplier_l2b_targets(db)
+            supplier_searches = self.repository.get_agent_supplier_searches(db, agent_id)
+            supplier_bookings = self.repository.get_agent_booking_counts_by_provider(db, agent_id)
 
             # --- 1. Compute Transparent Business Components ---
             reliability_score = self._compute_reliability_score(batch_stats, exp_stats)
             financial_score = self._compute_financial_score(credit_stats)
             experience_score = self._compute_experience_score(exp_stats)
-            booking_behavior_score = self._compute_booking_behavior_score(
-                search_activity, target_ratio
+            booking_behavior_score, l2b_detail = self._compute_supplier_l2b_component(
+                supplier_targets, supplier_searches, supplier_bookings
             )
 
             # --- 2. Composite Trust Score (Weights: Rel 40%, Fin 25%, Exp 15%, S2B 20%) ---
             # Components with no evidence (reliability / booking behavior returning
-            # None) are excluded and the remaining weights renormalized so the
-            # composite stays on the 0-100 scale and remains comparable.
+            # None) are excluded and their weight is redistributed proportionally
+            # among the available components (senior §5). The effective weights
+            # actually used are recorded for auditability.
             weights = get_settings().composite_weights
-            active_parts: dict[str, float] = {}
-            active_weight_sum = 0.0
-            if reliability_score is not None:
-                active_parts["reliability"] = reliability_score
-                active_weight_sum += weights["reliability"]
-            active_parts["financial"] = financial_score
-            active_parts["experience"] = experience_score
-            active_weight_sum += weights["financial"] + weights["experience"]
-            if booking_behavior_score is not None:
-                active_parts["search_to_booking"] = booking_behavior_score
-                active_weight_sum += weights["search_to_booking"]
-
-            composite_trust = round(
-                sum(active_parts[k] * weights[k] for k in active_parts) / active_weight_sum,
-                2,
+            composite_trust, weights_used, available_components, unavailable_components = (
+                self._combine_composite(
+                    {
+                        "reliability": reliability_score,
+                        "financial": financial_score,
+                        "experience": experience_score,
+                        "search_to_booking": booking_behavior_score,
+                    },
+                    weights,
+                )
             )
 
             # --- 3. ML Calibration Layer ---
@@ -347,8 +505,20 @@ class AgentTrustScorer:
                     )
                     ml_calibration_score = financial_score
 
-            # --- 4. Final Trust Score (80% Composite, 20% ML) ---
-            overall = round((composite_trust * 0.8) + (ml_calibration_score * 0.2))
+            # --- 4. Final Trust Score (Sprint 5 ML gate) ---
+            # The ML layer ships DISABLED. Gate logic (senior 15.1):
+            #   * if the programme is not configured OR not ready -> the agent's
+            #     overall score is round(composite_trust) -- never a blend and
+            #     never a financial-proxy fallback masquerading as ML.
+            #   * only when ready -> 80% composite / 20% combined ML weights.
+            settings = get_settings()
+            ml_ready = bool(
+                settings.ml_enabled and settings.ml_targets and ml_calibration_score is not None
+            )
+            if ml_ready:
+                overall = round((composite_trust * 0.8) + (ml_calibration_score * 0.2))
+            else:
+                overall = round(composite_trust)
             overall = max(5, min(overall, 100))
 
             # --- 5. High Risk Overrides ---
@@ -379,7 +549,17 @@ class AgentTrustScorer:
                     old_tier=prev_tier,
                     new_tier=tier,
                     event_type="score_shift",
-                    metadata={"trigger": "composite_recalculation"},
+                    metadata={
+                        "trigger": "composite_recalculation",
+                        "available_components": available_components,
+                        "unavailable_components": unavailable_components,
+                        "weights_used": weights_used,
+                        "l2b_policy": get_settings().l2b_not_configured_policy,
+                        "l2b_component": booking_behavior_score,
+                        "l2b_unconfigured_suppliers": l2b_detail.get(
+                            "unconfigured_suppliers", []
+                        ),
+                    },
                 )
             except Exception:
                 logger.exception("Audit logging skipped for agent %s", agent_id_val)
@@ -403,6 +583,7 @@ class AgentTrustScorer:
                     historical_late_payment_count=credit_stats.historical_late_payment_count,
                     historical_late_payment_ratio=credit_stats.historical_late_payment_ratio,
                     average_payment_delay_days=credit_stats.average_payment_delay_days,
+                    historical_max_payment_delay_days=credit_stats.maximum_payment_delay_days,
                     no_activity=is_inactive_overall,
                     daily=ConversionMetrics(**self._safe_metrics(batch_stats.get(1, {}))),
                     weekly=ConversionMetrics(**self._safe_metrics(batch_stats.get(7, {}))),

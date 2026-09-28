@@ -26,6 +26,7 @@ class AgentTrustFeatures(BaseModel):
     historical_late_payment_count: int = Field(default=0, ge=0)
     historical_late_payment_ratio: float = Field(default=0.0, ge=0, le=100)
     average_payment_delay_days: float = Field(default=0.0, ge=0)
+    historical_max_payment_delay_days: int = Field(default=0, ge=0)
     no_activity: bool = False
 
     daily: ConversionMetrics

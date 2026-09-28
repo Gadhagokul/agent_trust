@@ -46,6 +46,7 @@ REQUIRED_SCHEMA: dict[str, list[str]] = {
     ],
     "bookings": [
         "agent_id",
+        "provider",  # supplier attribution for L2B: equals suppliers.name
         "status",
         "total_amount",
         "created_at",

@@ -1,71 +1,96 @@
+# app/observability/metrics.py
+"""Sprint 5 - Prometheus instrumentation for the Agent Trust service.
+
+Optimized for the senior primitives: service tone (requests/duration) plus
+ML Target Programme counters. The ML counters are OBSERVABLE regardless of
+whether the ML gate is enabled: NOT_READY/fallback/rejection/promotion are
+recorded so operators can trace the readiness lifecycle even while DISABLED.
+"""
+
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from time import perf_counter
+from typing import Any
 
 from fastapi import Request, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
     Histogram,
-    generate_latest,
 )
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# ── Generic HTTP metrics ────────────────────────────────────────────────────
+# --- Service tone ---
 
-REQUEST_COUNT = Counter(
-    "agent_trust_http_requests_total",
-    "Total HTTP requests",
-    ["method", "path", "status"],
-)
-
-REQUEST_LATENCY = Histogram(
-    "agent_trust_http_request_duration_seconds",
-    "HTTP request latency in seconds",
-    ["method", "path"],
-)
-
-# ── Agent Trust-specific metrics ────────────────────────────────────────────
-
-AGENT_TRUST_REQUESTS = Counter(
+AGENT_TRUST_REQUESTS: Counter = Counter(
     "agent_trust_requests_total",
-    "Total agent trust score requests",
+    "Agent trust scoring requests",
     ["status"],
 )
-
-AGENT_TRUST_DURATION = Histogram(
+AGENT_TRUST_LATENCY: Histogram = Histogram(
     "agent_trust_scoring_duration_ms",
-    "Agent trust score calculation duration in milliseconds",
+    "Agent trust scoring latency in milliseconds",
+)
+
+AGENT_TRUST_DURATION: Histogram = AGENT_TRUST_LATENCY
+
+# --- ML Target Programme (Sprint 5, senior sec15-16) ---
+# Counters are defined ALWAYS but only increment while the ML gate is enabled,
+# so a disabled system still shows NOT_READY/first-predict transitions clearly.
+
+ML_PREDICTIONS: Counter = Counter(
+    "agent_trust_ml_predictions_total",
+    "ML calibration predictions attempted (gate-ON only)",
+)
+ML_NOT_READY: Counter = Counter(
+    "agent_trust_ml_not_ready_total",
+    "ML programme DISABLED or readiness-gated OFF on a request",
+)
+ML_FALLBACKS: Counter = Counter(
+    "agent_trust_ml_fallbacks_total",
+    "ML programme ready but a target fell back to rules due to errors",
+)
+MODEL_REJECTION: Counter = Counter(
+    "agent_trust_model_rejections_total",
+    "Challenger rejected on evaluation (champion kept)",
+)
+MODEL_PROMOTION: Counter = Counter(
+    "agent_trust_model_promotions_total",
+    "Challenger promoted to PRODUCTION on evaluation",
+)
+
+# --- Training lifecycle (Sprint 6, senior sec19-24) ---
+# Truthful accounting: TRAINING_RUNS counts runs that actually started (triggered
+# AND ready), so runs == success + failure. A tick that decides "nothing to do"
+# is NOT counted as a success - it is a skip and increments nothing.
+TRAINING_RUNS: Counter = Counter(
+    "agent_trust_training_runs_total",
+    "Training runs that actually started (triggered and ready)",
+)
+TRAINING_SUCCESS: Counter = Counter(
+    "agent_trust_training_success_total",
+    "Training runs that completed training and candidate evaluation",
+)
+TRAINING_FAILURE: Counter = Counter(
+    "agent_trust_training_failures_total",
+    "Training runs that ended in an error",
+)
+MODEL_ROLLBACK: Counter = Counter(
+    "agent_trust_model_rollbacks_total",
+    "Champion rolled back to the previous known-good production version",
 )
 
 
 class MetricsMiddleware(BaseHTTPMiddleware):
     async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
+        self, request: Request, call_next: Any
     ) -> Response:
-        method = request.method
-        path = request.url.path
-        start = perf_counter()
-
         response = await call_next(request)
-
-        elapsed = perf_counter() - start
-
-        REQUEST_LATENCY.labels(method=method, path=path).observe(elapsed)
-        REQUEST_COUNT.labels(
-            method=method,
-            path=path,
-            status=str(response.status_code),
-        ).inc()
-
+        AGENT_TRUST_REQUESTS.labels(status=str(response.status_code)).inc()
         return response
 
 
 def metrics_response() -> Response:
-    return Response(
-        generate_latest(),
-        media_type=CONTENT_TYPE_LATEST,
-    )
+    from fastapi.responses import Response as FastResponse
+    from prometheus_client import generate_latest as _generate_latest
+
+    return FastResponse(content=_generate_latest(), media_type=CONTENT_TYPE_LATEST)

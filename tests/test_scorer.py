@@ -1,12 +1,34 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
+from prometheus_client import REGISTRY
 
-from app.domain.errors import DatabaseUnavailableError
+from app.domain.errors import DatabaseUnavailableError, ModelUnavailableError
 from app.domain.models import AgentTrustResult
 from app.infra.db.repository import CreditStats
+from app.ml.trust_model import (
+    TRAINING_OUTCOME_PROMOTED,
+    TRAINING_OUTCOME_REJECTED,
+    TRAINING_OUTCOME_SKIPPED,
+    TRAINING_STATUS_COMPLETED,
+    TRAINING_STATUS_NOT_READY,
+    TrainedCandidate,
+    TrainingDataset,
+    TrainingState,
+    classify_trigger,
+    drift_trigger_status,
+    evaluate_classifier_candidate,
+    model_version_dir,
+    read_training_state,
+    rollback_champion,
+    run_training_controller,
+    stage_challenger,
+    validate_candidate_metrics,
+    verify_artifact_integrity,
+)
 from app.services.agent_trust_scorer import AgentTrustScorer
 
 
@@ -15,19 +37,28 @@ def scorer():
     return AgentTrustScorer()
 
 
-def _make_credit_stats(**overrides) -> CreditStats:
-    defaults = {
-        "current_overdue_count": 0,
-        "current_overdue_ratio": 0.0,
-        "current_max_delay_days": 0,
-        "outstanding_amount": 0.0,
-        "historical_late_payment_count": 0,
-        "historical_late_payment_ratio": 0.0,
-        "average_payment_delay_days": 0.0,
-        "consecutive_unpaid_cycles": 0,
-    }
-    defaults.update(overrides)
-    return CreditStats(**defaults)
+def _make_credit_stats(
+    current_overdue_count: int = 0,
+    current_overdue_ratio: float = 0.0,
+    current_max_delay_days: int = 0,
+    outstanding_amount: float = 0.0,
+    historical_late_payment_count: int = 0,
+    historical_late_payment_ratio: float = 0.0,
+    average_payment_delay_days: float = 0.0,
+    maximum_payment_delay_days: int = 0,
+    consecutive_unpaid_cycles: int = 0,
+) -> CreditStats:
+    return CreditStats(
+        current_overdue_count=current_overdue_count,
+        current_overdue_ratio=current_overdue_ratio,
+        current_max_delay_days=current_max_delay_days,
+        outstanding_amount=outstanding_amount,
+        historical_late_payment_count=historical_late_payment_count,
+        historical_late_payment_ratio=historical_late_payment_ratio,
+        average_payment_delay_days=average_payment_delay_days,
+        maximum_payment_delay_days=maximum_payment_delay_days,
+        consecutive_unpaid_cycles=consecutive_unpaid_cycles,
+    )
 
 
 def _minimal_conversion():
@@ -60,6 +91,7 @@ def _minimal_result_dict():
             "historical_late_payment_count": 0,
             "historical_late_payment_ratio": 0.0,
             "average_payment_delay_days": 0.0,
+            "historical_max_payment_delay_days": 0,
             "no_activity": True,
             "daily": conv,
             "weekly": conv,
@@ -141,7 +173,9 @@ class TestCalculate:
             "reused": 0,
             "bookings": 0,
         }
-        mock_repo.get_supplier_expected_ratio.return_value = 0.05
+        mock_repo.get_supplier_l2b_targets.return_value = []
+        mock_repo.get_agent_supplier_searches.return_value = []
+        mock_repo.get_agent_booking_counts_by_provider.return_value = []
 
         mock_ml = MagicMock()
         mock_ml_cls.return_value = mock_ml
@@ -209,7 +243,9 @@ class TestCalculate:
             "reused": 0,
             "bookings": 0,
         }
-        mock_repo.get_supplier_expected_ratio.return_value = 0.05
+        mock_repo.get_supplier_l2b_targets.return_value = []
+        mock_repo.get_agent_supplier_searches.return_value = []
+        mock_repo.get_agent_booking_counts_by_provider.return_value = []
 
         mock_ml = MagicMock()
         mock_ml_cls.return_value = mock_ml
@@ -545,10 +581,117 @@ class TestCreditStatsCorrectness:
         assert is_risk is True
         assert any("3 consecutive" in r for r in reasons)
 
+    def test_consecutive_threshold_configurable(self, scorer, monkeypatch):
+        fake = SimpleNamespace(
+            credit_max_overdue_ratio=50.0,
+            credit_max_delay_days=60,
+            credit_max_overdue_count=10,
+            credit_max_consecutive_overdue_cycles=4,
+        )
+        monkeypatch.setattr("app.services.agent_trust_scorer.get_settings", lambda: fake)
+        stats = _make_credit_stats(consecutive_unpaid_cycles=3)
+        is_risk, _ = scorer._check_high_risk(stats)
+        assert is_risk is False
+
     def test_consecutive_defaults_below_threshold_ok(self, scorer):
         stats = _make_credit_stats(consecutive_unpaid_cycles=2)
         is_risk, _ = scorer._check_high_risk(stats)
         assert is_risk is False
+
+
+class TestScoringConfiguration:
+    """Configuration defaults confirm the senior's 40/25/15/20 component weights."""
+
+    def _settings(self):
+        from app.infra.settings import Settings
+
+        return Settings(_env_file=None)
+
+    def test_composite_weights_default_matches_senior_spec(self):
+        weights = self._settings().composite_weights
+        assert weights == {
+            "reliability": 0.40,
+            "financial": 0.25,
+            "experience": 0.15,
+            "search_to_booking": 0.20,
+        }
+
+    def test_overdue_boundary_defaults_to_exclusive(self):
+        assert self._settings().credit_overdue_boundary == "<"
+
+    def test_high_risk_thresholds_are_configurable(self):
+        s = self._settings()
+        assert s.credit_max_delay_days == 60
+        assert s.credit_max_overdue_ratio == 50.0
+        assert s.credit_max_overdue_count == 10
+        assert s.credit_max_consecutive_overdue_cycles == 3
+        assert s.high_risk_score_cap == 30
+
+    def test_attribution_lists_default_to_empty_open(self):
+        s = self._settings()
+        assert s.non_agent_failure_reasons == []
+        assert s.non_agent_cancellation_reasons == []
+
+
+class TestCombineComposite:
+    """Missing-data redistribution exposes the effective weights (senior §5 / §14)."""
+
+    WEIGHTS: ClassVar[dict[str, float]] = {
+        "reliability": 0.40,
+        "financial": 0.25,
+        "experience": 0.15,
+        "search_to_booking": 0.20,
+    }
+
+    def test_all_available_uses_full_weights(self, scorer):
+        comp, weights_used, avail, unavail = scorer._combine_composite(
+            {
+                "reliability": 100.0,
+                "financial": 100.0,
+                "experience": 0.0,
+                "search_to_booking": 100.0,
+            },
+            self.WEIGHTS,
+        )
+        assert comp == 85.0
+        assert weights_used == self.WEIGHTS
+        assert avail == ["reliability", "financial", "experience", "search_to_booking"]
+        assert unavail == []
+
+    def test_s2b_unavailable_redistributes_per_senior_example(self, scorer):
+        """Senior §5 example: reliability 50%, financial 31.25%, experience 18.75%."""
+        comp, weights_used, avail, unavail = scorer._combine_composite(
+            {
+                "reliability": 100.0,
+                "financial": 100.0,
+                "experience": 0.0,
+                "search_to_booking": None,
+            },
+            self.WEIGHTS,
+        )
+        assert comp == 81.25
+        assert weights_used == {
+            "reliability": 0.5,
+            "financial": 0.3125,
+            "experience": 0.1875,
+        }
+        assert avail == ["reliability", "financial", "experience"]
+        assert unavail == ["search_to_booking"]
+
+    def test_reliability_and_s2b_unavailable(self, scorer):
+        comp, weights_used, avail, unavail = scorer._combine_composite(
+            {
+                "reliability": None,
+                "financial": 100.0,
+                "experience": 0.0,
+                "search_to_booking": None,
+            },
+            self.WEIGHTS,
+        )
+        assert comp == 62.5
+        assert weights_used == {"financial": 0.625, "experience": 0.375}
+        assert avail == ["financial", "experience"]
+        assert unavail == ["reliability", "search_to_booking"]
 
 
 class TestComputeBookingBehaviorScore:
@@ -618,6 +761,116 @@ class TestComputeBookingBehaviorScore:
         assert scorer._compute_booking_behavior_score(activity, 0.05) == exp
 
 
+class TestScoreL2bForTarget:
+    """Shared scoring curve used by aggregate + supplier L2B (Feature B)."""
+
+    def test_exact_target_scores_80(self, scorer):
+        assert scorer._score_l2b_for_target({"searches": 100, "bookings": 5}, 0.05) == 80.0
+
+    def test_none_target_is_excluded(self, scorer):
+        assert scorer._score_l2b_for_target({"searches": 100, "bookings": 5}, None) is None
+
+    def test_access_count_not_per_row_inflation(self, scorer):
+        # 2 bookings / 5 accesses = 40% ratio -> 85.0, never inflated to 100.0.
+        # Guards SUM(access_count) semantics: a few accesses must not read as
+        # perfect conversion just because the row counts are small.
+        assert scorer._score_l2b_for_target({"searches": 5, "bookings": 2}, 0.05) == 85.0
+
+
+class TestComputeSupplierL2bComponent:
+    """Supplier-specific L2B: per-supplier ratios vs site benchmarks + cap."""
+
+    def _call(self, scorer, targets, searches, bookings):
+        return scorer._compute_supplier_l2b_component(targets, searches, bookings)
+
+    def test_cap_redistribution_supplier_example(self, scorer):
+        # Shares 80/15/5, scores 40/80/90. Emirates (80%) is capped at 50% and
+        # the 30% excess is redistributed proportionally -> 61.25 (senior §13).
+        targets = [
+            {"code": "EK", "name": "Emirates", "target": 0.05},
+            {"code": "QR", "name": "Qatar", "target": 0.2},
+            {"code": "EY", "name": "Etihad", "target": 0.16},
+        ]
+        searches = [
+            {"code": "EK", "searches": 320},
+            {"code": "QR", "searches": 60},
+            {"code": "EY", "searches": 20},
+        ]
+        bookings = [
+            {"provider": "Emirates", "bookings": 8},
+            {"provider": "Qatar", "bookings": 12},
+            {"provider": "Etihad", "bookings": 8},
+        ]
+        component, detail = self._call(scorer, targets, searches, bookings)
+
+        assert component == 61.25
+        scores = {s["code"]: s["score"] for s in detail["supplier_scores"]}
+        assert scores == {"EK": 40.0, "QR": 80.0, "EY": 90.0}
+        shares = {s["code"]: s["share"] for s in detail["supplier_scores"]}
+        assert shares["EK"] == 0.5 and shares["QR"] == 0.375 and shares["EY"] == 0.125
+        assert detail["unconfigured_suppliers"] == []
+
+    def test_two_supplier_redistribution(self, scorer):
+        # A: 84, B: 64, shares 2/3-1/3 -> capped 50/50 -> 74.0
+        targets = [
+            {"code": "A", "name": "Sup A", "target": 0.05},
+            {"code": "B", "name": "Sup B", "target": 0.05},
+        ]
+        searches = [
+            {"code": "A", "searches": 600},
+            {"code": "B", "searches": 300},
+        ]
+        bookings = [
+            {"provider": "Sup A", "bookings": 48},
+            {"provider": "Sup B", "bookings": 12},
+        ]
+        component, _ = self._call(scorer, targets, searches, bookings)
+        assert component == 74.0
+
+    def test_unconfigured_supplier_excluded(self, scorer):
+        targets = [
+            {"code": "A", "name": "Sup A", "target": 0.05},
+            {"code": "C", "name": "Sup C", "target": None},
+        ]
+        searches = [
+            {"code": "A", "searches": 200},
+            {"code": "C", "searches": 100},
+        ]
+        bookings = [{"provider": "Sup A", "bookings": 10}]
+        component, detail = self._call(scorer, targets, searches, bookings)
+        assert component == 80.0
+        assert detail["unconfigured_suppliers"] == ["C"]
+        assert detail["component"] == 80.0
+
+    def test_all_unconfigured_returns_none(self, scorer):
+        targets = [{"code": "C", "name": "Sup C", "target": None}]
+        searches = [{"code": "C", "searches": 100}]
+        bookings = []
+        component, detail = self._call(scorer, targets, searches, bookings)
+        assert component is None
+        assert detail["unconfigured_suppliers"] == ["C"]
+
+    def test_missing_target_entry_excluded(self, scorer):
+        component, detail = self._call(scorer, [], [{"code": "X", "searches": 100}], [])
+        assert component is None
+        assert detail["unconfigured_suppliers"] == ["X"]
+
+    def test_single_supplier_keeps_full_share(self, scorer):
+        targets = [{"code": "SUP", "name": "Alpha Air", "target": 0.05}]
+        searches = [{"code": "SUP", "searches": 100}]
+        bookings = [{"provider": "Alpha Air", "bookings": 5}]
+        component, detail = self._call(scorer, targets, searches, bookings)
+        assert component == 80.0
+        assert detail["supplier_scores"][0]["share"] == 1.0
+
+    def test_zero_bookings_scores_zero_not_none(self, scorer):
+        targets = [{"code": "SUP", "name": "Alpha Air", "target": 0.05}]
+        searches = [{"code": "SUP", "searches": 100}]
+        bookings = []
+        component, _ = self._call(scorer, targets, searches, bookings)
+        assert component == 0.0
+
+
 class TestCompositeRenormalization:
     """Composite uses 40/25/15/20; renormalizes when S2B is excluded."""
 
@@ -629,6 +882,9 @@ class TestCompositeRenormalization:
         search_activity,
         batch_365=None,
         exp_stats=None,
+        supplier_targets=None,
+        supplier_searches=None,
+        booking_counts=None,
     ):
         mock_cache = MagicMock()
         mock_cache_cls.return_value = mock_cache
@@ -660,7 +916,9 @@ class TestCompositeRenormalization:
             "lifetime_cancelled": 0,
         }
         mock_repo.get_agent_search_activity.return_value = search_activity
-        mock_repo.get_supplier_expected_ratio.return_value = 0.05
+        mock_repo.get_supplier_l2b_targets.return_value = supplier_targets or []
+        mock_repo.get_agent_supplier_searches.return_value = supplier_searches or []
+        mock_repo.get_agent_booking_counts_by_provider.return_value = booking_counts or []
 
         mock_ml = MagicMock()
         mock_ml_cls.return_value = mock_ml
@@ -701,6 +959,9 @@ class TestCompositeRenormalization:
             mock_cache_cls,
             mock_ml_cls,
             {"searches": 100, "created": 80, "reused": 20, "bookings": 20},
+            supplier_targets=[{"code": "SUP", "name": "Alpha Air", "target": 0.05}],
+            supplier_searches=[{"code": "SUP", "searches": 100}],
+            booking_counts=[{"provider": "Alpha Air", "bookings": 20}],
         )
         result = AgentTrustScorer().calculate(db=MagicMock(), agent_id=1)
 
@@ -708,8 +969,9 @@ class TestCompositeRenormalization:
         assert result.features.search_activity["scored"] is True
         # (100*0.40 + 100*0.25 + 0*0.15 + 100*0.20) / 1.00 = 85.0
         assert result.scores.composite_trust_score == 85.0
-        # overall = round(85.0*0.8 + 80*0.2) = 84
-        assert result.scores.overall_score == 84
+        # Sprint 5: ML programme ships DISABLED by default (senior 15.1 gate);
+        # overall = round(composite_trust) = round(85.0) = 85 -- never a blend.
+        assert result.scores.overall_score == 85
 
     @patch("app.services.agent_trust_scorer.AuditRepository")
     @patch("app.services.agent_trust_scorer.TrustModelPredictor")
@@ -727,6 +989,9 @@ class TestCompositeRenormalization:
             batch_365={"bookings": 0, "bookstep_failed": 0},
             exp_stats={"created_at": None, "lifetime_bookings": 0,
                        "lifetime_revenue": 0.0, "lifetime_cancelled": 0},
+            supplier_targets=[{"code": "SUP", "name": "Alpha Air", "target": 0.05}],
+            supplier_searches=[{"code": "SUP", "searches": 100}],
+            booking_counts=[{"provider": "Alpha Air", "bookings": 20}],
         )
         result = AgentTrustScorer().calculate(db=MagicMock(), agent_id=1)
 
@@ -734,8 +999,9 @@ class TestCompositeRenormalization:
         assert result.scores.search_to_booking_score == 100.0
         # (100*0.25 + 0*0.15 + 100*0.20) / 0.60 = 75.0
         assert result.scores.composite_trust_score == 75.0
-        # overall = round(75.0*0.8 + 80*0.2) = 76
-        assert result.scores.overall_score == 76
+        # Sprint 5: ML programme ships DISABLED by default (senior 15.1 gate);
+        # overall = round(composite_trust) = round(75.0) = 75 -- never a blend.
+        assert result.scores.overall_score == 75
 
     @patch("app.services.agent_trust_scorer.AuditRepository")
     @patch("app.services.agent_trust_scorer.TrustModelPredictor")
@@ -759,7 +1025,402 @@ class TestCompositeRenormalization:
 
         assert result.scores.reliability_score is None
         assert result.scores.search_to_booking_score is None
-        # (100*0.25 + 0*0.15) / 0.40 = 62.50
+        # (100*0.25 + 100*0.15) / 0.40 = 62.50
         assert result.scores.composite_trust_score == 62.5
-        # overall = round(62.5*0.8 + 80*0.2) = 66
-        assert result.scores.overall_score == 66
+        # Sprint 5: ML programme ships DISABLED by default (senior 15.1 gate);
+        # overall = round(composite_trust) = round(62.5) = 62 -- never a blend.
+        assert result.scores.overall_score == 62
+
+
+# ── Sprint 6: Training Controller & automated model lifecycle ─────────────────
+
+
+def _s6_settings(**overrides):
+    base = {
+        "ml_enabled": True,
+        "ml_targets": ["severe_default"],
+        "ml_horizon_days": 30,
+        "ml_model_registry_dir": "unused",
+        "ml_trigger_increment": 100,
+        "ml_training_interval_days": 7,
+        "ml_promotion_headroom": 0.002,
+        "ml_classification_min_pr_auc": 0.30,
+        "ml_classification_min_f1": 0.40,
+        "ml_classification_max_brier": 0.25,
+        "ml_segment_max_recall_drop": 0.05,
+        "ml_readiness_min_samples": 2,
+        "ml_readiness_min_positive": 1,
+        "ml_readiness_min_negative": 1,
+        "ml_readiness_min_agents": 1,
+        "ml_readiness_max_positive_ratio": 0.95,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _counter(name: str) -> float:
+    value = REGISTRY.get_sample_value(name)
+    return 0.0 if value is None else float(value)
+
+
+def _s6_dataset(target, *, as_of, db, samples=4, positive=2):
+    return TrainingDataset(
+        target=target,
+        feature_rows=[[float(index)] for index in range(samples)],
+        labels=[1] * positive + [0] * (samples - positive),
+        stats={
+            "samples": samples,
+            "positive": positive,
+            "negative": samples - positive,
+            "agents": samples,
+        },
+        labeled_records=1000,
+    )
+
+
+def _s6_trainer(actual, probabilities, artifact=b"candidate-artifact"):
+    def _train(dataset):
+        return TrainedCandidate(
+            target=dataset.target,
+            actual=list(actual),
+            probabilities=list(probabilities),
+            artifact=artifact,
+            segments={"high_volume": list(range(len(actual)))},
+        )
+
+    return _train
+
+
+def test_controller_is_silent_noop_while_disabled(tmp_path):
+    settings = _s6_settings(ml_enabled=False, ml_model_registry_dir=str(tmp_path))
+    runs_before = _counter("agent_trust_training_runs_total")
+    success_before = _counter("agent_trust_training_success_total")
+    failure_before = _counter("agent_trust_training_failures_total")
+    promotions_before = _counter("agent_trust_model_promotions_total")
+
+    result = run_training_controller(
+        settings,
+        build_dataset=lambda *a, **k: pytest.fail("dataset must never be built while off"),
+        train_candidate=lambda *a, **k: pytest.fail("trainer must never run while off"),
+    )
+
+    assert result == {
+        "status": TRAINING_STATUS_NOT_READY,
+        "reason": "ml_programme_disabled",
+        "targets": {},
+    }
+    assert _counter("agent_trust_training_runs_total") == runs_before
+    assert _counter("agent_trust_training_success_total") == success_before
+    assert _counter("agent_trust_training_failures_total") == failure_before
+    assert _counter("agent_trust_model_promotions_total") == promotions_before
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_controller_not_ready_without_approved_targets(tmp_path):
+    settings = _s6_settings(ml_targets=[], ml_model_registry_dir=str(tmp_path))
+
+    result = run_training_controller(
+        settings,
+        build_dataset=lambda *a, **k: pytest.fail("dataset must never be built"),
+        train_candidate=lambda *a, **k: pytest.fail("trainer must never run"),
+    )
+
+    assert result["status"] == TRAINING_STATUS_NOT_READY
+    assert result["reason"] == "ml_targets_empty"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_classify_trigger_growth_uses_labelled_records_not_total_bookings():
+    state = TrainingState(
+        target="severe_default",
+        last_successful_training_at="2026-01-01T00:00:00+00:00",
+        last_training_labeled_records=500,
+    )
+    now = datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+    not_due = classify_trigger(
+        state=state, labeled_records=550, increment=100, interval_days=7, now=now
+    )
+    due = classify_trigger(
+        state=state, labeled_records=600, increment=100, interval_days=7, now=now
+    )
+
+    assert not_due.triggered is False
+    assert not_due.reason == "none"
+    assert due.triggered is True
+    assert due.reason == "data_growth"
+    assert due.detail == "growth=100"
+
+
+def test_classify_trigger_interval_and_cold_start():
+    cold = classify_trigger(
+        state=TrainingState(target="severe_default"),
+        labeled_records=0,
+        increment=100,
+        interval_days=7,
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    stale = classify_trigger(
+        state=TrainingState(
+            target="severe_default",
+            last_successful_training_at="2025-12-01T00:00:00+00:00",
+            last_training_labeled_records=10,
+        ),
+        labeled_records=10,
+        increment=100,
+        interval_days=7,
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    assert cold.triggered is True
+    assert cold.reason == "interval"
+    assert cold.detail == "no_successful_training_yet"
+    assert stale.triggered is True
+    assert stale.reason == "interval"
+    assert "elapsed_days" in stale.detail
+
+
+def test_drift_trigger_is_deferred_not_evaluated():
+    decision = drift_trigger_status()
+
+    assert decision.triggered is False
+    assert decision.reason == "drift_not_evaluated"
+    assert decision.detail == "drift_trigger_deferred"
+
+
+def test_no_trigger_is_skipped_and_is_not_a_training_success(tmp_path):
+    settings = _s6_settings(ml_model_registry_dir=str(tmp_path))
+    state = TrainingState(
+        target="severe_default",
+        last_successful_training_at="2026-01-01T00:00:00+00:00",
+        last_training_labeled_records=1000,
+    )
+    from app.ml.trust_model import write_training_state
+
+    write_training_state(str(tmp_path), state)
+    runs_before = _counter("agent_trust_training_runs_total")
+    success_before = _counter("agent_trust_training_success_total")
+
+    result = run_training_controller(
+        settings,
+        build_dataset=lambda *a, **k: pytest.fail("dataset must not be built"),
+        train_candidate=lambda *a, **k: pytest.fail("trainer must not run"),
+        labeled_count_reader=lambda db, target, as_of: 1000,
+        now=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+
+    target_result = result["targets"]["severe_default"]
+    assert target_result["outcome"] == TRAINING_OUTCOME_SKIPPED
+    assert target_result["reason"] == "no_trigger"
+    assert _counter("agent_trust_training_runs_total") == runs_before
+    assert _counter("agent_trust_training_success_total") == success_before
+    persisted = read_training_state(str(tmp_path), "severe_default")
+    assert persisted.last_run_outcome == TRAINING_OUTCOME_SKIPPED
+    assert persisted.last_run_reason == "no_trigger"
+
+
+def test_readiness_not_ready_is_skipped_and_not_a_success(tmp_path):
+    settings = _s6_settings(ml_model_registry_dir=str(tmp_path))
+    success_before = _counter("agent_trust_training_success_total")
+    runs_before = _counter("agent_trust_training_runs_total")
+
+    result = run_training_controller(
+        settings,
+        build_dataset=lambda target, *, as_of, db: _s6_dataset(
+            target, as_of=as_of, db=db, samples=1, positive=1
+        ),
+        train_candidate=_s6_trainer([0, 1], [0.1, 0.9]),
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    target_result = result["targets"]["severe_default"]
+    assert target_result["outcome"] == TRAINING_OUTCOME_SKIPPED
+    assert target_result["reason"] == "readiness_not_ready"
+    assert _counter("agent_trust_training_runs_total") == runs_before + 1
+    assert _counter("agent_trust_training_success_total") == success_before
+
+
+def test_first_candidate_is_promoted_as_first_production(tmp_path):
+    settings = _s6_settings(ml_model_registry_dir=str(tmp_path))
+    promotions_before = _counter("agent_trust_model_promotions_total")
+    success_before = _counter("agent_trust_training_success_total")
+
+    result = run_training_controller(
+        settings,
+        build_dataset=_s6_dataset,
+        train_candidate=_s6_trainer([0, 1], [0.1, 0.9]),
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+    target_result = result["targets"]["severe_default"]
+    assert result["status"] == TRAINING_STATUS_COMPLETED
+    assert target_result["outcome"] == TRAINING_OUTCOME_PROMOTED
+    assert target_result["decision"] == "first_production"
+    assert target_result["version"] == "v001"
+    assert _counter("agent_trust_model_promotions_total") == promotions_before + 1
+    assert _counter("agent_trust_training_success_total") == success_before + 1
+    state = read_training_state(str(tmp_path), "severe_default")
+    assert state.current_production_version == "v001"
+    assert state.previous_known_good_production_version is None
+    assert state.current_production_score == 1.0
+    artifact = model_version_dir(str(tmp_path), "severe_default", "v001") / "model.joblib"
+    assert artifact.read_bytes() == b"candidate-artifact"
+
+
+def test_challenger_that_does_not_beat_headroom_keeps_champion(tmp_path):
+    registry = str(tmp_path)
+    settings = _s6_settings(ml_model_registry_dir=registry)
+    run_training_controller(
+        settings,
+        build_dataset=_s6_dataset,
+        train_candidate=_s6_trainer([0, 1], [0.4, 0.6]),
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    rejections_before = _counter("agent_trust_model_rejections_total")
+
+    result = run_training_controller(
+        settings,
+        build_dataset=_s6_dataset,
+        train_candidate=_s6_trainer([0, 1], [0.45, 0.55]),
+        labeled_count_reader=lambda db, target, as_of: 5000,
+        now=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+
+    target_result = result["targets"]["severe_default"]
+    assert target_result["outcome"] == TRAINING_OUTCOME_REJECTED
+    assert target_result["decision"] in {"keep_champion", "reject_challenger"}
+    assert _counter("agent_trust_model_rejections_total") == rejections_before + 1
+    state = read_training_state(registry, "severe_default")
+    assert state.current_production_version == "v001"
+
+
+def test_promotion_then_rollback_targets_previous_known_good(tmp_path):
+    registry = str(tmp_path)
+    settings = _s6_settings(ml_model_registry_dir=registry)
+    # Champion candidate: passes every gate (pr_auc 0.5833, f1 0.5, brier 0.2456)
+    # but is beatable, so the next run can genuinely win the comparison.
+    run_training_controller(
+        settings,
+        build_dataset=_s6_dataset,
+        train_candidate=_s6_trainer([0, 0, 1, 1], [0.6, 0.4, 0.6, 0.45]),
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    run_training_controller(
+        settings,
+        build_dataset=_s6_dataset,
+        train_candidate=_s6_trainer([0, 1], [0.1, 0.9]),
+        labeled_count_reader=lambda db, target, as_of: 5000,
+        now=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    promoted = read_training_state(registry, "severe_default")
+    assert promoted.current_production_version == "v002"
+    assert promoted.previous_known_good_production_version == "v001"
+    rollbacks_before = _counter("agent_trust_model_rollbacks_total")
+
+    rolled_back = rollback_champion(registry_dir=registry, state=promoted)
+
+    assert _counter("agent_trust_model_rollbacks_total") == rollbacks_before + 1
+    assert rolled_back.current_production_version == "v003"
+    assert rolled_back.previous_known_good_production_version == "v002"
+    restored = model_version_dir(registry, "severe_default", "v003") / "model.joblib"
+    assert restored.read_bytes() == b"candidate-artifact"
+    assert rolled_back.last_run_outcome == "ROLLED_BACK"
+
+
+def test_rollback_without_previous_known_good_is_refused():
+    state = TrainingState(target="severe_default", current_production_version="v001")
+
+    with pytest.raises(ModelUnavailableError):
+        rollback_champion(registry_dir="unused", state=state)
+
+
+def test_artifact_integrity_detects_tampering(tmp_path):
+    version, artifact_path, digest = stage_challenger(
+        registry_dir=str(tmp_path),
+        target="severe_default",
+        artifact=b"original-bytes",
+    )
+
+    assert version == "v001"
+    assert verify_artifact_integrity(artifact_path, digest) is True
+    artifact_path.write_bytes(b"tampered")
+    assert verify_artifact_integrity(artifact_path, digest) is False
+
+
+def test_classifier_metrics_match_hand_computed_values():
+    perfect = evaluate_classifier_candidate(
+        [0, 0, 1, 1], [0.1, 0.2, 0.8, 0.9], segments={"high_volume": [2, 3]}
+    )
+    mixed = evaluate_classifier_candidate([0, 1, 1, 0], [0.6, 0.7, 0.8, 0.2])
+    degenerate = evaluate_classifier_candidate([1, 1, 1], [0.2, 0.5, 0.9])
+
+    assert perfect["roc_auc"] == 1.0
+    assert perfect["pr_auc"] == 1.0
+    assert perfect["precision"] == 1.0
+    assert perfect["recall"] == 1.0
+    assert perfect["f1"] == 1.0
+    assert perfect["brier"] == 0.025
+    assert perfect["segment_recall_high_volume"] == 1.0
+    assert mixed["precision"] == 0.6667
+    assert mixed["recall"] == 1.0
+    assert mixed["f1"] == 0.8
+    assert mixed["fp"] == 1.0
+    assert mixed["tp"] == 2.0
+    assert degenerate["degenerate"] == 1.0
+    assert degenerate["pr_auc"] == 0.0
+
+
+def test_validation_gate_rejects_low_quality_and_segment_regression():
+    low_quality = {"degenerate": 0.0, "pr_auc": 0.10, "f1": 0.90, "brier": 0.10}
+    regressed = {
+        "degenerate": 0.0,
+        "pr_auc": 0.80,
+        "f1": 0.90,
+        "brier": 0.10,
+        "segment_recall_low_volume": 0.40,
+    }
+
+    quality_ok, quality_reason = validate_candidate_metrics(
+        low_quality, min_pr_auc=0.30, min_f1=0.40, max_brier=0.25
+    )
+    segment_ok, segment_reason = validate_candidate_metrics(
+        regressed,
+        min_pr_auc=0.30,
+        min_f1=0.40,
+        max_brier=0.25,
+        champion_segment_recall={"low_volume": 0.90},
+        max_segment_recall_drop=0.05,
+    )
+    passing, passing_reason = validate_candidate_metrics(
+        {"degenerate": 0.0, "pr_auc": 0.80, "f1": 0.90, "brier": 0.10},
+        min_pr_auc=0.30,
+        min_f1=0.40,
+        max_brier=0.25,
+    )
+
+    assert quality_ok is False
+    assert "pr_auc_below_minimum" in quality_reason
+    assert segment_ok is False
+    assert "segment_regression" in segment_reason
+    assert passing is True
+    assert passing_reason == "passed"
+
+
+def test_supervisor_is_not_enabled_with_shipped_defaults():
+    from app.infra.settings import Settings
+    from app.main import training_supervisor_enabled
+
+    settings = Settings(
+        db_host="localhost",
+        db_database="db",
+        db_username="user",
+        db_password="password",
+        laravel_service_token="x" * 40,
+    )
+
+    assert settings.ml_enabled is False
+    assert settings.ml_targets == []
+    assert training_supervisor_enabled(settings) is False
+    assert training_supervisor_enabled(
+        _s6_settings(ml_enabled=True, ml_targets=["severe_default"])
+    ) is True

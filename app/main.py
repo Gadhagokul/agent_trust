@@ -21,6 +21,80 @@ from app.observability.request_context import RequestContextMiddleware
 
 logger = logging.getLogger(__name__)
 
+TRAINING_LOCK_NAME = "agent_trust:ml_training_lock"
+
+
+def training_supervisor_enabled(settings) -> bool:
+    """The supervisor only exists while the ML programme is switched on.
+
+    With the shipped defaults (ml_enabled=False, ml_targets=[]) this returns
+    False, so no task is created, no lock is taken and no training code loads.
+    """
+    return bool(settings.ml_enabled) and bool(settings.ml_targets)
+
+
+async def _training_supervisor(settings) -> None:
+    """Periodic training opportunity (Sprint 6).
+
+    Wakes every ml_training_poll_hours, takes a Redis lock so only one worker
+    trains per tick, and runs the training controller in a worker thread so the
+    event loop is never blocked. The controller opens and closes its own DB
+    session; no session is created here and none crosses the thread boundary.
+    Any failure is logged and retried on the next tick - it never kills the API.
+    """
+    from app.infra.db.session import SessionLocal
+    from app.ml.trust_model import (
+        build_default_dataset,
+        run_training_controller,
+        train_random_forest_candidate,
+    )
+
+    poll_seconds = max(1, int(settings.ml_training_poll_hours)) * 3600
+
+    def build_dataset(target, *, as_of, db):
+        return build_default_dataset(settings, db, target, as_of=as_of)
+
+    def labeled_count_reader(db, target, as_of):
+        from app.infra.db.repository import AgentRepository
+
+        return AgentRepository().get_labeled_sample_count(
+            db,
+            target=target,
+            horizon_days=int(settings.ml_horizon_days),
+            as_of=as_of,
+        )
+
+    while True:
+        await asyncio.sleep(poll_seconds)
+        lock = None
+        try:
+            lock = get_redis_provider().client.lock(
+                TRAINING_LOCK_NAME,
+                timeout=int(settings.ml_training_lock_ttl_seconds),
+            )
+            if not lock.acquire(blocking=False):
+                logger.info("ML training tick skipped: lock held by another worker")
+                continue
+            logger.info("ML training tick: running training controller")
+            await asyncio.to_thread(
+                run_training_controller,
+                settings,
+                build_dataset=build_dataset,
+                train_candidate=train_random_forest_candidate,
+                session_factory=SessionLocal,
+                labeled_count_reader=labeled_count_reader,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("ML training tick failed; retried on the next tick")
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    logger.warning("ML training lock release failed", exc_info=True)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -32,19 +106,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info("Service started", extra={"env": settings.app_env, "version": settings.app_version})
 
-    yield
-
-    engine.dispose()
-    logger.info("Database connections closed")
+    training_task: asyncio.Task | None = None
+    if training_supervisor_enabled(settings):
+        training_task = asyncio.create_task(_training_supervisor(settings))
+        app.state.training_supervisor = training_task
+        logger.info(
+            "ML training supervisor started (poll every %sh)",
+            settings.ml_training_poll_hours,
+        )
+    else:
+        logger.info("ML training supervisor not started (ML programme disabled)")
 
     try:
-        redis_provider = get_redis_provider()
-        redis_provider.client.close()
-        logger.info("Redis connection closed")
-    except Exception:
-        pass
+        yield
+    finally:
+        if training_task is not None:
+            training_task.cancel()
+            try:
+                await training_task
+            except asyncio.CancelledError:
+                pass
+        engine.dispose()
+        logger.info("Database connections closed")
 
-    logger.info("Service shut down gracefully")
+        try:
+            redis_provider = get_redis_provider()
+            redis_provider.client.close()
+            logger.info("Redis connection closed")
+        except Exception:
+            pass
+
+        logger.info("Service shut down gracefully")
 
 
 app = FastAPI(

@@ -52,3 +52,36 @@ class ModelUnavailableError(DomainError):
             code="model_unavailable",
             message=message,
         )
+
+
+class MLTargetNotConfiguredError(DomainError):
+    """Raised when a label build is attempted for a target that is not approved."""
+
+    def __init__(self, target: str = "none"):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="ml_target_not_configured",
+            message=f"ML target {target!r} is not configured. Approve a target before training.",
+        )
+
+
+class DatasetLeakError(DomainError):
+    """Raised when dataset construction violates the features<=T / label>T rule."""
+
+    def __init__(self, message: str = "ML dataset contains a temporal leakage violation"):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="dataset_leak",
+            message=message,
+        )
+
+
+class MLDatasetLeakError(DomainError):
+    """Raised when dataset construction leaks future data into features or past data into labels."""
+
+    def __init__(self, message: str = "ML dataset contains a temporal data leak"):
+        super().__init__(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="ml_dataset_leak",
+            message=message,
+        )

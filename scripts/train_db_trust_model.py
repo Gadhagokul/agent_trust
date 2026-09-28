@@ -1,190 +1,142 @@
 # scripts/train_db_trust_model.py
+"""Sprint 5/6 - per-target ML Target Programme trainer (ships DISABLED).
+
+The trainer is part of the disabled-by-default ML Target Programme (senior
+15.1 / 16-24). It runs ONLY when the programme is both configured AND the
+scorer's ml_ready gate is live. While disabled (the shipped default) the
+trainer is a SILENT LOG-ONLY NO-OP:
+
+    * never builds a programme dataset;
+    * never evaluates readiness;
+    * never trains a model;
+    * never writes to the model registry;
+    * never increments any ML counter.
+
+This matches the senior 15.1 exit: 'the programme ships disabled; nothing
+runs while it is off, and the final score is round(composite_trust) -- never
+a blend'. The disabled gate below is the ONLY code path reached while off,
+and it does not even import the training stack (no RandomForest / repository on
+the active path).
+
+Sprint 6 adds the real ENABLED path: when the programme is on, this entrypoint
+delegates to the training controller (app.ml.trust_model), which owns trigger
+evaluation, readiness, candidate evaluation, champion/challenger promotion and
+rollback. The classifier trainer and the dataset builder are injected into the
+controller, keeping the dependency direction one-way (scripts -> app).
+"""
+
 import logging
-import os
-import sys
-from datetime import date
 
-import joblib
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
-from sqlalchemy import text
+from app.infra.settings import get_settings
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from app.infra.db.repository import AgentRepository
-from app.infra.db.session import SessionLocal
-
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+PROGRAMME_STATUS_NOT_READY = "NOT_READY"
+PROGRAMME_STATUS_READY = "READY"
+PROGRAMME_REASON_DISABLED = "ml_programme_disabled"
+PROGRAMME_REASON_GATE_OFF = "ml_ready_gate_off"
+PROGRAMME_REASON_ENABLED = "programme_enabled"
 
-def _calculate_real_world_outcome(db, agent_id) -> float:
+
+def _programme_gate(settings) -> dict:
+    """Silent readiness gate. Returns the disabled/not-ready outcome.
+
+    NEVER raises. NEVER builds a dataset. NEVER trains. This is the only
+    code path reached while the programme is off, and it is a silent
+    log-only no-op (senior 15.1: nothing runs while disabled).
     """
-    Computes a heuristic target score (5.0 to 100.0) used as a pseudo-label
-    for training. Penalties cover repayment delays, outstanding defaults, and
-    BookStep failures, using the same search/booking definitions as the
-    production Search-to-Booking pipeline:
-    - searches: COUNT(DISTINCT search_session_id) over search_session_accesses
-    - bookings: status IN ('confirmed', 'ticketed')
-    - failures: booking_processes current_step='BookStep' AND state='FAILED',
-      capped at searches_30d * 0.7 (matching production).
-    This is a heuristic/manual label, not a directly measured outcome.
+    ml_enabled = bool(getattr(settings, "ml_enabled", False))
+    ml_targets = list(getattr(settings, "ml_targets", []) or [])
+
+    if not ml_enabled:
+        reason = PROGRAMME_REASON_DISABLED
+    elif not ml_targets:
+        reason = PROGRAMME_REASON_GATE_OFF
+    else:
+        logger.info(
+            "ml_programme gate: %s (ml_enabled=%s ml_targets=%d)",
+            PROGRAMME_REASON_ENABLED,
+            ml_enabled,
+            len(ml_targets),
+        )
+        return {
+            "status": PROGRAMME_STATUS_READY,
+            "reason": PROGRAMME_REASON_ENABLED,
+            "targets": ml_targets,
+        }
+
+    logger.info(
+        "ml_programme gate: %s (ml_enabled=%s ml_targets=%d)",
+        reason,
+        ml_enabled,
+        len(ml_targets),
+    )
+    return {"status": PROGRAMME_STATUS_NOT_READY, "reason": reason}
+
+
+def _run_enabled_programme(settings) -> dict:
+    """Sprint 6 enabled path: run the real training controller.
+
+    The controller owns the lifecycle (trigger, readiness, candidate evaluation,
+    champion/challenger, promotion, rollback) and receives the dataset builder and
+    the classifier trainer as injected callables, so the dependency direction stays
+    one-way (scripts -> app) and no circular import is possible. The session is
+    opened here and closed by the controller's own finally block.
     """
-    tx_rows = db.execute(
-        text("""
-            SELECT status, due_date, payment_date
-            FROM credit_transactions
-            WHERE agent_id = :agent_id
-        """),
-        {"agent_id": agent_id},
-    ).fetchall()
+    from app.infra.db.session import SessionLocal
+    from app.ml.trust_model import (
+        build_default_dataset,
+        run_training_controller,
+        train_random_forest_candidate,
+    )
 
-    score = 100.0
+    def build_dataset(target, *, as_of, db):
+        return build_default_dataset(settings, db, target, as_of=as_of)
 
-    for row in tx_rows:
-        status, due_date_val, payment_date_val = row
+    def labeled_count_reader(db, target, as_of):
+        from app.infra.db.repository import AgentRepository
 
-        d_date = due_date_val.date() if hasattr(due_date_val, "date") else due_date_val
-        p_date = payment_date_val.date() if hasattr(payment_date_val, "date") else payment_date_val
+        return AgentRepository().get_labeled_sample_count(
+            db,
+            target=target,
+            horizon_days=int(settings.ml_horizon_days),
+            as_of=as_of,
+        )
 
-        if status == "paid":
-            if p_date and d_date and p_date > d_date:
-                delay = (p_date - d_date).days
-                score -= min(delay * 1.5, 25.0)
-        else:
-            today = date.today()
-            if d_date and today > d_date:
-                delay = (today - d_date).days
-                score -= min(delay * 2.0, 40.0)
-                score -= 10.0
-
-    searches_30d = 0
-    stats_30d = db.execute(
-        text("""
-            SELECT
-                (SELECT COUNT(DISTINCT search_session_id) FROM search_session_accesses
-                 WHERE agent_id = :agent_id
-                   AND first_accessed_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)) as searches,
-                (SELECT COUNT(*) FROM bookings
-                 WHERE agent_id = :agent_id
-                   AND status IN ('confirmed', 'ticketed')
-                   AND created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)) as bookings
-        """),
-        {"agent_id": agent_id},
-    ).fetchone()
-
-    if stats_30d:
-        searches_30d, bookings = stats_30d
-        searches_30d = int(searches_30d or 0)
-        bookings = int(bookings or 0)
-        if searches_30d > 50 and bookings == 0:
-            score -= 20.0
-
-    fails = db.execute(
-        text("""
-            SELECT COUNT(*)
-            FROM booking_processes bp
-            JOIN agents a ON a.user_id = bp.user_id
-            WHERE a.id = :agent_id
-              AND bp.current_step = 'BookStep'
-              AND bp.state = 'FAILED'
-              AND bp.created_at >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-        """),
-        {"agent_id": agent_id},
-    ).scalar() or 0
-
-    fails = min(fails, int(searches_30d * 0.7))
-    score -= min(fails * 2.0, 15.0)
-
-    return max(5.0, min(score, 100.0))
+    return run_training_controller(
+        settings,
+        build_dataset=build_dataset,
+        train_candidate=train_random_forest_candidate,
+        session_factory=SessionLocal,
+        labeled_count_reader=labeled_count_reader,
+    )
 
 
-def extract_and_train():
-    db = SessionLocal()
-    repo = AgentRepository()
+def main() -> dict:
+    """Trainer entrypoint. Ships DISABLED: this is a silent no-op while off.
 
-    logger.info("Connecting to Database and fetching all active agents...")
-
-    try:
-        agent_rows = db.execute(text("SELECT id FROM agents")).fetchall()
-        agent_ids = [row[0] for row in agent_rows]
-    except Exception as e:
-        logger.error("Failed to fetch agents from database: %s", e)
-        db.close()
-        return
-
-    logger.info("Found %d agents. Extracting features and computing outcomes...", len(agent_ids))
-
-    x_list = []
-    y_list = []
-
-    for agent_id in agent_ids:
-        try:
-            real_outcome = _calculate_real_world_outcome(db, agent_id)
-
-            batch_stats = repo.get_multi_timeframe_stats(db, agent_id)
-            credit_stats = repo.get_credit_stats(db, agent_id)
-
-            stats_7d = batch_stats.get(7, {})
-            stats_30d = batch_stats.get(30, {})
-
-            feature_vector = [
-                stats_7d.get("effective_searches", 0),
-                stats_7d.get("bookings", 0),
-                stats_30d.get("effective_searches", 0),
-                stats_30d.get("bookings", 0),
-                credit_stats.current_overdue_count,
-                credit_stats.current_overdue_ratio,
-                credit_stats.current_max_delay_days,
-            ]
-
-            x_list.append(feature_vector)
-            y_list.append(real_outcome)
-
-        except Exception as e:
-            logger.warning("Failed to extract data for agent %s: %s", agent_id, e)
-            continue
-
-    db.close()
-
-    if not x_list:
-        logger.error("No training data could be extracted.")
-        return
-
-    x = np.array(x_list)
-    y = np.array(y_list)
-
-    logger.info("Successfully extracted %d valid training samples.", len(x))
-    logger.info("Training Predictive RandomForestRegressor on real-world outcomes...")
-
-    x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.2, random_state=42)
-    model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42)
-    model.fit(x_train, y_train)
-
-    preds = model.predict(x_test)
-    r2_score = model.score(x_test, y_test)
-    mae = mean_absolute_error(y_test, preds)
-    rmse = mean_squared_error(y_test, preds, squared=False)
-    logger.info("Model metrics on test split: R^2=%.4f MAE=%.4f RMSE=%.4f", r2_score, mae, rmse)
-
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    model_dir = os.path.join(base_dir, "app", "ml", "models")
-    os.makedirs(model_dir, exist_ok=True)
-
-    model_path = os.path.join(model_dir, "trust_model_v1.pkl")
-    tmp_model_path = f"{model_path}.tmp"
-
-    try:
-        joblib.dump(model, tmp_model_path)
-        os.replace(tmp_model_path, model_path)
-        logger.info("Model saved atomically to %s", model_path)
-    except Exception as e:
-        logger.error("Failed to save model atomically: %s", e)
-        if os.path.exists(tmp_model_path):
-            os.remove(tmp_model_path)
+    The gate below is the first and ONLY executable statement of the active
+    path. While ml_enabled=False (the default) the trainer never builds a
+    dataset, never evaluates readiness, never trains, and never writes to the
+    model registry. This matches senior 15.1 exactly: 'the programme ships
+    disabled and never runs while off'. When the programme IS enabled this
+    entrypoint delegates to the Sprint 6 training controller.
+    """
+    settings = get_settings()
+    gate = _programme_gate(settings)
+    if gate["status"] != PROGRAMME_STATUS_READY:
+        logger.info(
+            "ml_programme trainer: status=%s reason=%s -- no dataset, no training, "
+            "no registry write (ships disabled, senior 15.1).",
+            gate["status"],
+            gate["reason"],
+        )
+        return gate
+    result = _run_enabled_programme(settings)
+    logger.info("ml_programme trainer: status=%s", result.get("status"))
+    return result
 
 
 if __name__ == "__main__":
-    extract_and_train()
+    outcome = main()
+    print(f"ml_programme trainer: status={outcome.get('status')} reason={outcome.get('reason')}")

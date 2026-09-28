@@ -191,6 +191,40 @@ This service reads from the Laravel-maintained MySQL database. The **required sc
 | `suppliers` | Supplier catalog: `code`, `name`, `is_active`, `health_status`, `search_limit` (quota cap), `minimum_booking` (S2B target only) |
 | `booking_process` | Booking funnel step tracking |
 
+### Supplier-specific Search-to-Book (L2B) — Sprint 2 (active rule)
+
+The Search-to-Booking component is computed **per supplier** from the existing
+tables only — no new configuration table is consumed.
+
+- **Site-level benchmarks (senior §10-13):** each active supplier's target is
+  `suppliers.minimum_booking / suppliers.search_limit`, read fresh on every score
+  (no cache layer). `minimum_booking` never restricts searches; it only sets the
+  L2B target. A supplier is *configured* only when both columns are present and
+  `search_limit > 0`; otherwise it is **excluded** — the scorer never invents
+  compliance for an unconfigured supplier (`l2b_not_configured_policy = "exclude"`).
+- **Agent searches per supplier:** `SUM(search_session_accesses.access_count)`
+  joined through `search_supplier_runs`, counting **created + reused** intents
+  (both are the agent searching; excluding reuse would inflate L2B). Confirmed
+  from real data: one session queries every supplier the agent selected, so the
+  same access_count legitimately contributes to each participating supplier.
+- **Bookings per supplier:** `bookings.provider = suppliers.name`.
+- **Per-supplier scoring:** `ratio_s = bookings_s / searches_s` vs `target_s`
+  through the existing curve. **Aggregation:** share-weighted (share = supplier
+  search volume ÷ total configured volume) with `l2b_max_supplier_share`
+  (default 0.5) capping any single supplier's influence; the excess is
+  redistributed proportionally (senior §13).
+- **Open item (business, not yet decided):** channel grouping
+  (`l2b_group_by_channel = false`). The channel dimension is not present in the
+  schema, so grouping stays OFF until the business defines it.
+
+**Confirmed data relationships (Sprint 2):**
+- **Agent** dimension: `search_session_accesses.agent_id`.
+- **Supplier** dimension: `search_supplier_runs.supplier_id` / `supplier_code`
+  (one row per supplier per search session — verified against real data).
+- **Booking → supplier** link: `bookings.provider` = `suppliers.name`.
+- **Channel** dimension (NDC / GDS) is **not present** in the current schema —
+  grouping by channel stays OFF (`l2b_group_by_channel = false`).
+
 ### Authentication & Authorization
 
 Every request must present the shared **service token** as `Authorization: Bearer <token>`. This token is the same value in the Laravel `.env` and the FastAPI `.env` (`LARAVEL_SERVICE_TOKEN`); it authenticates the *Laravel service*, not a user login. Laravel attaches it to every request; missing or wrong token → **401**.
@@ -291,31 +325,129 @@ REACT_APP_TRUST_API_TOKEN=<service-token>
 | **Reliability** | 40% | Booking success rate (64.3%), cancellation quality (35.7%) — no evidence → component excluded |
 | **Financial** | 25% | Unpaid ratio + payment delay penalty |
 | **Experience** | 15% | Account tenure + lifetime booking volume |
-| **Search-to-Booking** | 20% | Created + reused search intents vs confirmed/ticketed bookings, last 365 days |
-| **ML Calibration** | 20% of final | RandomForest overlay trained on historical repayment data |
+| **Search-to-Booking** | 20% | Per-supplier search-to-book compliance vs site benchmarks (`suppliers.minimum_booking/search_limit`), last 365 days |
+| **ML Calibration** | 20% of final | Future-risk model(s) — see ML Target Proposal below |
 
 Final score = `(Composite × 0.8) + (ML × 0.2)`, capped at 100.
 
+> **Sprint 5 (active design, all ML currently DISABLED):** when ML is `NOT_READY` the ML
+> contribution is dropped and the final score is the rule composite alone
+> (**§15.1**: `Final = round(Composite)`), never a "re-created today score". When all gates
+> pass the final is `round(Composite × 0.8 + ML × 0.2)`.
+
+### ML Target Proposal (Sprint 5 — business review)
+
+The legacy ML calibration (a RandomForest trained on a heuristic pseudo-label that
+recomputed *today's* score from the *same* signals as the rules) is being retired. It is
+replaced by a **per-target future-risk** framework: each target is its own binary model
+predicting the probability of a defined future event within a horizon window.
+
+| Target | ML prediction |
+|--------|---------------|
+| `severe_default` | Probability the agent develops a severe payment/default event in the next horizon (a credit transaction ≥30 days past-due/unpaid, or a §27 high-risk condition) |
+| `severe_reliability` | Probability the agent has a severe booking failure/cancellation event in the next horizon (≥50% of eligible attempts fail/cancel) |
+| `l2b_breach` | Probability the agent breaches a supplier's L2B limit (any `ratio_s > target_s`) in the next horizon |
+
+- **No leakage:** features use only data at/before `T`; labels come only from `(T, T + horizon]`.
+- **Readiness gate per target:** no model runs/trains until its target has enough labeled
+  positives/negatives (`ml_readiness_*` settings) and the datasets pass leakage validation.
+- **Registry:** each target keeps its own immutable version registry with an explicit
+  status (`PRODUCTION | CHALLENGER | REJECTED`); only a checksum-verified `PRODUCTION`
+  artifact is ever loaded.
+- **Two-switch approval model:** nothing trains, loads, or influences the live score until
+  (1) business approves the target list + horizon (`ml_targets`), AND (2) the validated
+  model is promoted AND `ml_enabled = true`.
+- **Combiner (Option B):** when READY, the three per-target probabilities are converted to
+  scores (`ml_risk_to_score_mode`, default `linear_inverse` = `100 − p`) and combined with
+  the configured weights per target (`ml_risk_to_score_weights`; placeholder proposal
+  `severe_default` 40 / `severe_reliability` 35 / `l2b_breach` 25). Weights are renormalized
+  over the READY targets only.
+
+**Open approvals requested from business/data-science:**
+1. Target list + horizon(s) (30 / 60 / 90 days).
+2. Combiner weights (proposal: 40 / 35 / 25) and the risk→score mapping (`100 − p`).
+
+Until both are approved the service ships with `ml_targets = []` and `ml_enabled = false`
+=> ML is always `NOT_READY` => `Final = round(Composite)`.
+
+### Sprint 6 - Automated Training Lifecycle (all ML currently DISABLED)
+
+Sprint 6 adds the controller that trains, evaluates, promotes, and rolls back per-target
+models. It is **defined but disabled**: with `ml_enabled = false` (or `ml_targets = []`) the
+supervisor is never started, no dataset is built, no registry write happens, and the live
+score stays `Final = round(Composite)`.
+
+**Execution paths (both call the same controller):**
+
+| Path | Trigger | Notes |
+|------|---------|-------|
+| Supervisor (`app/main.py`) | Every `ml_training_poll_hours` while the app runs | Redis lock (`ml_training_lock_ttl_seconds`) guarantees a single trainer across workers/instances; work runs in `asyncio.to_thread` and the controller opens/closes its own DB session |
+| CLI (`scripts/train_db_trust_model.py`) | On demand / cron | Useful for initial backfill before enabling the supervisor |
+
+**Pipeline per target:** gate -> trigger -> readiness -> dataset (`T = as_of - horizon`,
+features at/before `T`, labels in `(T, T+horizon]`) -> train (`RandomForestClassifier`,
+temporal hold-out) -> evaluate -> validate -> verify SHA-256 -> promote/reject.
+
+**Triggers** (a run with no trigger is `SKIPPED`/`NOT_RUN` and never counts as a success):
+
+| Trigger | Rule |
+|---------|------|
+| `data_growth` | Eligible labeled records grew by `ml_trigger_increment` since the last successful run (never total bookings) |
+| `interval` | `ml_training_interval_days` elapsed since the last successful training (first run is always due) |
+| `drift` | **Deferred** this phase - reported as `NOT_EVALUATED`, never a trigger |
+
+**Evaluation** is classification (binary default-risk), reported on a temporal hold-out:
+ROC-AUC, PR-AUC, precision, recall, F1, Brier calibration, confusion matrix, and per-segment
+recall. A candidate must clear `ml_classification_min_pr_auc`, `ml_classification_min_f1`,
+`ml_classification_max_brier`, and must not regress any segment recall by more than
+`ml_segment_max_recall_drop` versus the champion. These thresholds and the
+`ml_promotion_headroom` margin are project defaults, not senior-specified values.
+
+**Champion/challenger + rollback:** the challenger is promoted only if it beats the champion
+by `ml_promotion_headroom`; otherwise the champion is kept and the candidate is stored as
+`REJECTED` (auditable, never loaded). Promotion rotates the registry state so
+`previous_known_good_production_version` always names the explicit prior production version -
+rollback copies that artifact forward as a new version (`v003`, ...) and never guesses
+`v{N-1}`.
+
+**State and artifacts** live under `ml_model_registry_dir/<target>/`: `state.json`
+(controller state: last successful run, labeled-record watermark, production/champion
+version, per-segment recall, last outcome) and `vNNN/model.joblib` + `vNNN/metadata.json`
+(status `PRODUCTION | CHALLENGER | REJECTED`, SHA-256, score, gate decisions).
+
+**Metrics:** `agent_trust_training_runs_total`, `agent_trust_training_success_total`,
+`agent_trust_training_failures_total`, `agent_trust_model_promotions_total`,
+`agent_trust_model_rejections_total`, `agent_trust_model_rollbacks_total`.
+
+### Tiers
+
 ### Search-to-Booking Component (Feature B)
 
-- **Searches** = `COUNT(DISTINCT search_session_id)` across created **and** reused
-  search intents (`search_session_accesses`) in the last 365 days.
-- **Bookings** = confirmed/ticketed bookings, same 365-day boundary.
-- **Target ratio** is derived from the DB, not hardcoded: `Σ minimum_booking / Σ search_limit`
-  over active suppliers (~0.05, i.e. 1 booking per 20 searches). `minimum_booking`
-  never blocks searches — it only sets this target.
-- Score uses a baseline + progressive curve (both anchors configurable via
+- **Per-supplier benchmark**: `target_s = suppliers.minimum_booking / search_limit`
+  per active supplier (site-level configuration — never derived per agent).
+- **Agent searches**: `SUM(access_count)` per supplier from
+  `search_session_accesses × search_supplier_runs`, 365-day window, created **and**
+  reused both count. **Bookings** per supplier = `bookings.provider` =
+  `suppliers.name`, confirmed/ticketed, same window.
+- **Supplier score**: `ratio_s = bookings_s / searches_s` vs `target_s` on the
+  baseline + progressive curve (anchors configurable via
   `SEARCH_TO_BOOKING_AT_TARGET_SCORE` and `SEARCH_TO_BOOKING_EXCELLENT_MULTIPLIER`):
-  meeting (not exceeding) the target ratio equals the minimum acceptable score
-  (default **80**); the score rises linearly to **100** at `excellent_multiplier` ×
-  the target ratio (default **4×** = 20%). Below the target it ramps linearly
-  from 0 up to the acceptable score.
-- Low-volume confidence: the base score is blended toward neutral 80 by
-  `min(1, searches / 20)`; 0 bookings at high volume → 0.
-- Example (33 searches, target 5%): 0 bookings → 0, 1 → 48.5, 2 (=minimum) → 81.4,
-  3 → 85.5, 4 → 89.5, 5 → 93.5, 6 → 97.6, 7+ → 100.
-- **No search data** in 365 days → component excluded (`null`) and the composite
-  is recomputed over the remaining active weights (fully additive design).
+  meeting (not exceeding) the target equals the minimum acceptable score
+  (default **80**); rising linearly to **100** at `excellent_multiplier` × target
+  (default **4×**). Below the target it ramps linearly toward 0.
+- **Aggregation**: share-weighted mean of per-supplier scores, where share =
+  supplier search volume ÷ total configured volume. No supplier may drive more
+  than `l2b_max_supplier_share` (default 50%); the excess is redistributed
+  proportionally. Example: suppliers at 80%/15%/5% search share scoring
+  40/80/90 → **61.25**.
+- Low-volume confidence: `min(1, searches / 20)` blends the base toward neutral
+  80; 0 bookings at high volume → 0. `SUM(access_count)` semantics mean a small
+  number of accesses can never read as perfect conversion.
+- **No configured supplier / no search data** in 365 days → component excluded
+  (`null`) and the composite recomputes over the remaining active weights
+  (senior §5).
+- Audit metadata records `l2b_component`, `l2b_policy`, and
+  `l2b_unconfigured_suppliers`.
 - Rollback: `SEARCH_TO_BOOKING_AT_TARGET_SCORE=100` +
   `SEARCH_TO_BOOKING_EXCELLENT_MULTIPLIER=1` reproduces the pre-curve behavior.
 
