@@ -205,6 +205,15 @@ class Settings(BaseSettings):
 
     # Audit log file path
     audit_log_path: str = "logs/agent_score_audits.log"
+    # Maximum number of bytes read from the end of the audit log when looking up
+    # an agent's previous score. The read is bounded so per-request cost stays
+    # flat as the log grows; a rotated entry beyond this window is still found
+    # by walking the backup files newest-first.
+    audit_tail_read_bytes: int = 262_144
+    # Rotate the active log once it grows past this size.
+    audit_rotate_max_bytes: int = 10_485_760
+    # Number of rotated generations to retain (.log.1 .. .log.N).
+    audit_backup_count: int = 3
 
     @property
     def database_url(self) -> str:
@@ -231,6 +240,14 @@ class Settings(BaseSettings):
             raise RuntimeError("credit_overdue_boundary must be '<' or '<='")
         if self.credit_max_consecutive_overdue_cycles < 1:
             raise RuntimeError("credit_max_consecutive_overdue_cycles must be at least 1")
+        # A non-positive tail budget would silently restore the unbounded read
+        # this setting exists to prevent, so enforce a usable floor.
+        if self.audit_tail_read_bytes < 1024:
+            raise RuntimeError("audit_tail_read_bytes must be at least 1024")
+        if self.audit_rotate_max_bytes <= self.audit_tail_read_bytes:
+            raise RuntimeError("audit_rotate_max_bytes must be greater than audit_tail_read_bytes")
+        if self.audit_backup_count < 1:
+            raise RuntimeError("audit_backup_count must be at least 1")
         if self.app_env in ("production", "staging") and not self.cors_origins:
             raise RuntimeError("CORS_ORIGINS must be configured for production/staging deployment")
         if self.app_env in ("production", "staging") and not self.webhook_secret:

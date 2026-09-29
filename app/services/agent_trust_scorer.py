@@ -710,6 +710,23 @@ class AgentTrustScorer:
                         "available_components": available_components,
                         "unavailable_components": unavailable_components,
                         "weights_used": weights_used,
+                        "component_scores": {
+                            "reliability": reliability_score,
+                            "financial": financial_score,
+                            "experience": experience_score,
+                            "booking_behavior": booking_behavior_score,
+                        },
+                        "high_risk_flag": is_high_risk,
+                        "high_risk_reasons": high_risk_reasons,
+                        "high_risk_score_cap": (
+                            settings.high_risk_score_cap if is_high_risk else None
+                        ),
+                        "data_snapshot": {
+                            "evaluated_on": datetime.now(timezone.utc).date().isoformat(),
+                            "credit_overdue_boundary": get_settings().credit_overdue_boundary,
+                        },
+                        "model_version": "rules_v1",
+                        "calculation_timestamp": datetime.now(timezone.utc).isoformat(),
                         "l2b_policy": get_settings().l2b_not_configured_policy,
                         "l2b_component": booking_behavior_score,
                         "l2b_unconfigured_suppliers": l2b_detail.get(

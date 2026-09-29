@@ -43,6 +43,7 @@ ignore = ["B008"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
-addopts = "-ra -q"
+addopts = "-ra -q -m 'not integration'"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["integration: requires live MySQL and Redis (run with: pytest -m integration)"]
