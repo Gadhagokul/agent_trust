@@ -203,6 +203,20 @@ class Settings(BaseSettings):
     reliability_success_prior_rate: float = 0.5
     reliability_cancellation_prior_rate: float = 0.5
 
+    # Tier boundaries (senior spec §29), configurable rather than hard-coded in
+    # the scorer. "High Risk" is deliberately NOT a member: it is a sentinel
+    # returned when high risk triggers or the score falls below the bronze
+    # floor, not a configurable band.
+    tier_thresholds: dict[str, float] = {
+        "platinum": 80.0,
+        "gold": 65.0,
+        "silver": 50.0,
+        "bronze": 35.0,
+    }
+    # Platinum additionally requires no overdue invoices and a short max delay.
+    platinum_max_overdue_count: int = 0
+    platinum_max_delay_days: int = 5
+
     # Audit log file path
     audit_log_path: str = "logs/agent_score_audits.log"
     # Maximum number of bytes read from the end of the audit log when looking up
@@ -330,6 +344,22 @@ class Settings(BaseSettings):
         ):
             if not 0 < prior < 1:
                 raise RuntimeError(f"{name} must be strictly between 0 and 1, got {prior}")
+        if set(self.tier_thresholds) != {"platinum", "gold", "silver", "bronze"}:
+            raise RuntimeError(
+                "tier_thresholds must define exactly platinum|gold|silver|bronze; "
+                "'High Risk' is a sentinel, not a configurable tier"
+            )
+        if not all(0.0 <= v <= 100.0 for v in self.tier_thresholds.values()):
+            raise RuntimeError("tier_thresholds values must be within 0-100")
+        if not (
+            self.tier_thresholds["platinum"]
+            > self.tier_thresholds["gold"]
+            > self.tier_thresholds["silver"]
+            > self.tier_thresholds["bronze"]
+        ):
+            raise RuntimeError("tier_thresholds must be strictly descending")
+        if self.platinum_max_overdue_count < 0 or self.platinum_max_delay_days < 0:
+            raise RuntimeError("platinum_max_overdue_count/max_delay_days must be non-negative")
 
 
 @lru_cache(maxsize=1)

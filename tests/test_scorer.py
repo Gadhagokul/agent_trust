@@ -397,34 +397,88 @@ class TestComputeReliabilityScore:
 
 class TestDetermineTier:
     def test_platinum(self, scorer):
-        assert scorer._determine_tier(85, 0, 0.0, 0) == "Platinum"
+        assert scorer._determine_tier(85, False, 0, 0) == "Platinum"
 
     def test_gold(self, scorer):
-        assert scorer._determine_tier(70, 0, 0.0, 0) == "Gold"
+        assert scorer._determine_tier(70, False, 0, 0) == "Gold"
 
     def test_silver(self, scorer):
-        assert scorer._determine_tier(55, 0, 0.0, 0) == "Silver"
+        assert scorer._determine_tier(55, False, 0, 0) == "Silver"
 
     def test_bronze(self, scorer):
-        assert scorer._determine_tier(40, 0, 0.0, 0) == "Bronze"
+        assert scorer._determine_tier(40, False, 0, 0) == "Bronze"
 
     def test_high_risk_low_score(self, scorer):
-        assert scorer._determine_tier(20, 0, 0.0, 0) == "High Risk"
+        # Below the bronze floor is the High Risk sentinel even with a clean
+        # payment record -- a deliberate, spec-sanctioned naming conflation.
+        assert scorer._determine_tier(20, False, 0, 0) == "High Risk"
 
-    def test_high_risk_via_overdue_ratio(self, scorer):
-        assert scorer._determine_tier(80, 0, 60.0, 0) == "High Risk"
-
-    def test_high_risk_via_delay(self, scorer):
-        assert scorer._determine_tier(80, 0, 0.0, 70) == "High Risk"
-
-    def test_high_risk_via_overdue_count(self, scorer):
-        assert scorer._determine_tier(80, 10, 0.0, 0) == "High Risk"
+    def test_high_risk_flag_forces_sentinel(self, scorer):
+        assert scorer._determine_tier(85, True, 0, 0) == "High Risk"
+        assert scorer._determine_tier(85, True, 10, 70) == "High Risk"
 
     def test_platinum_requires_zero_overdue(self, scorer):
-        assert scorer._determine_tier(85, 1, 0.0, 0) == "Gold"
+        assert scorer._determine_tier(85, False, 1, 0) == "Gold"
 
     def test_platinum_requires_low_delay(self, scorer):
-        assert scorer._determine_tier(85, 0, 0.0, 5) == "Gold"
+        assert scorer._determine_tier(85, False, 0, 5) == "Gold"
+
+    @pytest.mark.parametrize(
+        ("overall", "expected"),
+        [
+            (79.9, "Gold"),
+            (80.0, "Platinum"),
+            (64.9, "Silver"),
+            (50.0, "Silver"),
+            (49.9, "Bronze"),
+            (35.0, "Bronze"),
+            (34.9, "High Risk"),
+        ],
+    )
+    def test_boundaries(self, scorer, overall, expected):
+        assert scorer._determine_tier(overall, False, 0, 0) == expected
+
+    def _override_settings(self, monkeypatch, **overrides):
+        base = {
+            "tier_thresholds": {
+                "platinum": 80.0,
+                "gold": 65.0,
+                "silver": 50.0,
+                "bronze": 35.0,
+            },
+            "platinum_max_overdue_count": 0,
+            "platinum_max_delay_days": 5,
+        }
+        fake = SimpleNamespace(**{**base, **overrides})
+        monkeypatch.setattr(
+            "app.services.agent_trust_scorer.get_settings", lambda: fake
+        )
+        return fake
+
+    def test_thresholds_come_from_config(self, scorer, monkeypatch):
+        # The regression guard for A2: this fails if anyone re-hard-codes the
+        # 80/65/50/35 literals back into _determine_tier.
+        self._override_settings(
+            monkeypatch,
+            tier_thresholds={
+                "platinum": 95.0,
+                "gold": 75.0,
+                "silver": 55.0,
+                "bronze": 30.0,
+            },
+        )
+        assert scorer._determine_tier(95, False, 0, 0) == "Platinum"
+        assert scorer._determine_tier(92, False, 0, 0) == "Gold"
+        assert scorer._determine_tier(76, False, 0, 0) == "Gold"
+        assert scorer._determine_tier(56, False, 0, 0) == "Silver"
+        assert scorer._determine_tier(31, False, 0, 0) == "Bronze"
+        assert scorer._determine_tier(30, False, 0, 0) == "Bronze"
+        assert scorer._determine_tier(29.9, False, 0, 0) == "High Risk"
+
+    def test_platinum_conditions_come_from_config(self, scorer, monkeypatch):
+        self._override_settings(monkeypatch, platinum_max_delay_days=30)
+        assert scorer._determine_tier(85, False, 0, 20) == "Platinum"
+        assert scorer._determine_tier(85, False, 0, 31) == "Gold"
 
 
 class TestDetermineBadges:
@@ -640,6 +694,70 @@ class TestScoringConfiguration:
         s = self._settings()
         assert s.non_agent_failure_reasons == []
         assert s.non_agent_cancellation_reasons == []
+
+
+class TestTierThresholdValidation:
+    """A2: tier config is validated like every other settings group."""
+
+    def _settings(self, **overrides):
+        from app.infra.settings import Settings
+
+        return Settings(_env_file=None, **overrides)
+
+    def test_defaults_pass(self):
+        self._settings()._validate_startup()
+
+    def test_valid_override_passes(self):
+        self._settings(
+            tier_thresholds={
+                "platinum": 95.0,
+                "gold": 75.0,
+                "silver": 55.0,
+                "bronze": 30.0,
+            },
+            platinum_max_overdue_count=1,
+            platinum_max_delay_days=10,
+        )._validate_startup()
+
+    def test_missing_key_rejected(self):
+        with pytest.raises(RuntimeError, match="tier_thresholds must define"):
+            self._settings(tier_thresholds={"platinum": 80.0, "gold": 65.0,
+                                            "silver": 50.0})._validate_startup()
+
+    def test_extra_key_rejected(self):
+        with pytest.raises(RuntimeError, match="tier_thresholds must define"):
+            self._settings(tier_thresholds={"platinum": 80.0, "gold": 65.0,
+                                            "silver": 50.0, "bronze": 35.0,
+                                            "diamond": 90.0})._validate_startup()
+
+    def test_high_risk_key_rejected_as_sentinel(self):
+        # "High Risk" must stay a sentinel, not a fifth configurable band.
+        with pytest.raises(RuntimeError, match="tier_thresholds must define"):
+            self._settings(tier_thresholds={"platinum": 80.0, "gold": 65.0,
+                                            "silver": 50.0, "bronze": 35.0,
+                                            "high_risk": 35.0})._validate_startup()
+
+    def test_out_of_range_rejected(self):
+        with pytest.raises(RuntimeError, match="within 0-100"):
+            self._settings(tier_thresholds={"platinum": 120.0, "gold": 65.0,
+                                            "silver": 50.0, "bronze": 35.0})._validate_startup()
+        with pytest.raises(RuntimeError, match="within 0-100"):
+            self._settings(tier_thresholds={"platinum": -1.0, "gold": 65.0,
+                                            "silver": 50.0, "bronze": 35.0})._validate_startup()
+
+    def test_non_descending_rejected(self):
+        with pytest.raises(RuntimeError, match="strictly descending"):
+            self._settings(tier_thresholds={"platinum": 60.0, "gold": 65.0,
+                                            "silver": 50.0, "bronze": 35.0})._validate_startup()
+        with pytest.raises(RuntimeError, match="strictly descending"):
+            self._settings(tier_thresholds={"platinum": 80.0, "gold": 65.0,
+                                            "silver": 50.0, "bronze": 50.0})._validate_startup()
+
+    def test_negative_platinum_scalar_rejected(self):
+        with pytest.raises(RuntimeError, match="must be non-negative"):
+            self._settings(platinum_max_overdue_count=-1)._validate_startup()
+        with pytest.raises(RuntimeError, match="must be non-negative"):
+            self._settings(platinum_max_delay_days=-1)._validate_startup()
 
 
 class TestCombineComposite:
@@ -1039,6 +1157,33 @@ class TestCompositeRenormalization:
         # Sprint 5: ML programme ships DISABLED by default (senior 15.1 gate);
         # overall = round(composite_trust) = round(62.5) = 62 -- never a blend.
         assert result.scores.overall_score == 62
+
+    @patch("app.services.agent_trust_scorer.AuditRepository")
+    @patch("app.services.agent_trust_scorer.TrustModelPredictor")
+    @patch("app.services.agent_trust_scorer.CacheAdapter")
+    @patch("app.services.agent_trust_scorer.AgentRepository")
+    def test_high_risk_evaluated_once_per_calculate(
+        self, mock_repo_cls, mock_cache_cls, mock_ml_cls, mock_audit_cls
+    ):
+        # A2: the credit_max_* comparisons must run exactly once -- the old
+        # _determine_tier duplicate block is gone.
+        self._setup_scorer(
+            mock_repo_cls,
+            mock_cache_cls,
+            mock_ml_cls,
+            {"searches": 0, "created": 0, "reused": 0, "bookings": 0},
+        )
+        scorer = AgentTrustScorer()
+        original = scorer._check_high_risk
+        calls: list[int] = []
+
+        def counting(credit_stats):
+            calls.append(1)
+            return original(credit_stats)
+
+        scorer._check_high_risk = counting
+        scorer.calculate(db=MagicMock(), agent_id=1)
+        assert len(calls) == 1
 
 
 # ── Sprint 6: Training Controller & automated model lifecycle ─────────────────

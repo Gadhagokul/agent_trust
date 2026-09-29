@@ -116,34 +116,39 @@ class AgentTrustScorer:
     def _determine_tier(
         self,
         overall: int,
+        is_high_risk: bool,
         current_overdue_count: int,
-        current_overdue_ratio: float,
         current_max_delay_days: int,
     ) -> str:
         """
         Maps the final blended overall_score to a tier label.
 
-        Platinum : >= 80, zero overdue and delay < 5 days
-        Gold     : >= 65
-        Silver   : >= 50
-        Bronze   : >= 35
-        High Risk: < 35 OR overdue_ratio > max OR delay > max OR overdue_count >= max
+        Platinum : >= tier_thresholds["platinum"], at most
+                   platinum_max_overdue_count overdue and delay
+                   < platinum_max_delay_days
+        Gold     : >= tier_thresholds["gold"]
+        Silver   : >= tier_thresholds["silver"]
+        Bronze   : >= tier_thresholds["bronze"]
+        High Risk: sentinel returned when is_high_risk is set, or the score
+                   falls below the bronze floor. It is NOT a configurable band;
+                   high-risk detection lives in _check_high_risk.
         """
-        settings = get_settings()
-        if (
-            current_overdue_ratio > settings.credit_max_overdue_ratio
-            or current_max_delay_days > settings.credit_max_delay_days
-            or current_overdue_count >= settings.credit_max_overdue_count
-        ):
+        if is_high_risk:
             return "High Risk"
 
-        if overall >= 80 and current_overdue_count == 0 and current_max_delay_days < 5:
+        settings = get_settings()
+        t = settings.tier_thresholds
+        if (
+            overall >= t["platinum"]
+            and current_overdue_count <= settings.platinum_max_overdue_count
+            and current_max_delay_days < settings.platinum_max_delay_days
+        ):
             return "Platinum"
-        elif overall >= 65:
+        elif overall >= t["gold"]:
             return "Gold"
-        elif overall >= 50:
+        elif overall >= t["silver"]:
             return "Silver"
-        elif overall >= 35:
+        elif overall >= t["bronze"]:
             return "Bronze"
         else:
             return "High Risk"
@@ -685,8 +690,8 @@ class AgentTrustScorer:
 
             tier = self._determine_tier(
                 overall,
+                is_high_risk,
                 credit_stats.current_overdue_count,
-                credit_stats.current_overdue_ratio,
                 credit_stats.current_max_delay_days,
             )
 
