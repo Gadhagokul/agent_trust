@@ -479,6 +479,10 @@ Prometheus metrics are exposed at `/metrics` (bearer-gated by `METRICS_TOKEN`).
 HTTP and cache series label by **route template** (e.g. `/v1/trust-score/{agent_id}`),
 never raw URLs or query strings; requests that match no route are labeled `unmatched`.
 
+The operator-focused manual lives in
+[`docs/OPS_RUNBOOK.md`](docs/OPS_RUNBOOK.md): architecture, configuration,
+startup, failure modes, recovery and rollback.
+
 Key series:
 
 - `agent_trust_http_requests_total{status,method,route}` — HTTP volume and errors
