@@ -4,7 +4,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -12,16 +12,39 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.v1.router import api_router
 from app.domain.errors import DomainError
-from app.infra.db.session import engine
+from app.infra.db.schema_guard import validate_schema
+from app.infra.db.session import SessionLocal, engine
 from app.infra.redis_provider import get_redis_provider
 from app.infra.settings import get_settings
 from app.observability.logging import configure_logging
 from app.observability.metrics import MetricsMiddleware, metrics_response
 from app.observability.request_context import RequestContextMiddleware
+from app.security.auth import get_metrics_viewer
 
 logger = logging.getLogger(__name__)
 
 TRAINING_LOCK_NAME = "agent_trust:ml_training_lock"
+
+
+def startup_schema_check_required(settings) -> bool:
+    """Startup schema validation is a production fail-fast, not a dev burden.
+
+    Development/local/test keep a DB-optional boot (unit tests construct the
+    app without a MySQL server); production/staging refuse to boot into a
+    drifted external schema (senior §39).
+    """
+    return settings.app_env in ("production", "staging")
+
+
+def _run_startup_schema_check(settings) -> None:
+    """Fail at boot when the external DB no longer matches REQUIRED_SCHEMA."""
+    db = SessionLocal()
+    try:
+        missing = validate_schema(db)
+    finally:
+        db.close()
+    if missing:
+        raise RuntimeError(f"Database schema drift on startup: {missing}")
 
 
 def training_supervisor_enabled(settings) -> bool:
@@ -103,6 +126,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
 
     settings._validate_startup()
+
+    if startup_schema_check_required(settings):
+        _run_startup_schema_check(settings)
 
     logger.info("Service started", extra={"env": settings.app_env, "version": settings.app_version})
 
@@ -186,9 +212,9 @@ app.add_middleware(
 )
 
 
-# Expose Prometheus metrics
+# Expose Prometheus metrics (bearer-gated, senior §38)
 @app.get("/metrics")
-def metrics():
+def metrics(_: None = Depends(get_metrics_viewer)):
     return metrics_response()
 
 

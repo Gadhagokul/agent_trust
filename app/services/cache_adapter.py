@@ -66,8 +66,11 @@ class CacheAdapter:
 
     def invalidate(self, key: str) -> None:
         try:
-            self.redis.delete(key)
-            logger.info("Cache manually invalidated for key '%s'", key)
+            # One atomic DEL clears both the primary and the 24h stale copy. A
+            # webhook declares the agent's state changed, so the stale fallback
+            # would otherwise keep serving a superseded score during a DB outage.
+            self.redis.delete(key, f"{STALE_PREFIX}{key}")
+            logger.info("Cache manually invalidated for key '%s' (%s)", key, f"stale:{key}")
         except Exception as exc:
             logger.warning("Cache INVALIDATE failed for key '%s': %s", key, exc)
 

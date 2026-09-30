@@ -22,6 +22,8 @@ REQUIRED_SCHEMA: dict[str, list[str]] = {
         "user_id",  # Identity: users -> agents mapping
         "is_active",
         "approval_status",
+        "created_at",  # Account age for the experience component
+        "email",  # Admin trust-score search (search_agents)
     ],
     "users": [
         "id",
@@ -84,6 +86,7 @@ REQUIRED_SCHEMA: dict[str, list[str]] = {
         "agent_id",
         "first_access_type",  # 'created' -> real supplier request; 'reused' -> cache hit
         "first_accessed_at",
+        "access_count",  # Search volume (SUM) for supplier-specific L2B
     ],
 }
 

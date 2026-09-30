@@ -587,14 +587,13 @@ def test_cache_roundtrip_and_ttl(integration_redis, monkeypatch):
     assert cache.get_stale("trust:agent:1:conversion") == {"score": 88}, "stale tier must survive"
 
 
-def test_cache_invalidate_leaves_stale_copy_behind(integration_redis, monkeypatch):
+def test_cache_invalidate_clears_both_tiers(integration_redis, monkeypatch):
     """
-    KNOWN GAP: invalidate() deletes only the primary key, leaving the 24h stale
-    copy intact. When the database is unavailable that stale copy is then served
-    for up to a day after a webhook declared the agent's state changed.
+    A4: invalidate() deletes BOTH the primary key AND the 24h stale copy.
 
-    The assertion documents CURRENT behaviour. It is inverted when the A4 fix
-    (invalidate both tiers) lands.
+    A domain-event webhook declares the agent's state changed, so serving the
+    stale fallback after an invalidation would hand out a superseded score
+    during a later DB outage.
     """
     monkeypatch.setattr(
         "app.services.cache_adapter.get_redis_provider",
@@ -606,8 +605,8 @@ def test_cache_invalidate_leaves_stale_copy_behind(integration_redis, monkeypatc
     cache.invalidate("trust:agent:2:conversion")
 
     assert cache.get("trust:agent:2:conversion") is None, "primary must be cleared"
-    assert integration_redis.exists("stale:trust:agent:2:conversion") == 1, (
-        "KNOWN GAP: the stale copy survives invalidation today (see plan item A4)"
+    assert integration_redis.exists("stale:trust:agent:2:conversion") == 0, (
+        "A4: the stale copy must be cleared by invalidation too"
     )
 
 

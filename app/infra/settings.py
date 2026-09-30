@@ -1,5 +1,6 @@
 import logging
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,6 +32,10 @@ class Settings(BaseSettings):
     # Security
     laravel_service_token: str = ""
     webhook_secret: str = ""
+    # Bearer token guarding the Prometheus /metrics endpoint. Required in
+    # production/staging (see _validate_startup). Separate from the service
+    # token so scrape credentials rotate independently.
+    metrics_token: str = ""
     rate_limit_per_minute: int = 120
 
     # Identity
@@ -266,6 +271,19 @@ class Settings(BaseSettings):
             raise RuntimeError("CORS_ORIGINS must be configured for production/staging deployment")
         if self.app_env in ("production", "staging") and not self.webhook_secret:
             raise RuntimeError("WEBHOOK_SECRET must be set in production/staging")
+        if self.app_env in ("production", "staging") and not self.metrics_token:
+            raise RuntimeError("METRICS_TOKEN must be set in production/staging")
+
+        # Redis URL shape (senior §38: Redis authentication/TLS where applicable).
+        # redis.from_url already maps rediss:// -> TLS; this only rejects
+        # misconfigured schemes/hosts at boot instead of on the first request.
+        parsed_redis = urlparse(self.redis_url)
+        if parsed_redis.scheme not in ("redis", "rediss"):
+            raise RuntimeError(
+                f"REDIS_URL scheme must be redis:// or rediss://, got {parsed_redis.scheme!r}"
+            )
+        if not parsed_redis.hostname:
+            raise RuntimeError("REDIS_URL must include a host")
         if self.supplier_quota_period_type not in ("lifetime", "daily", "monthly", "rolling"):
             raise RuntimeError(
                 f"supplier_quota_period_type must be one of lifetime|daily|monthly|rolling, "
