@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from app.api.v1.deps import enforce_rate_limit
 from app.api.v1.schemas import DomainEventPayload
 from app.infra.settings import get_settings
+from app.observability.metrics import WEBHOOKS
 from app.security.auth import Principal
 from app.services.cache_adapter import CacheAdapter
 
@@ -36,12 +37,14 @@ def handle_domain_event(
     settings = get_settings()
 
     if not settings.webhook_secret:
+        WEBHOOKS.labels(outcome="no_secret_configured").inc()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Webhook secret not configured",
         )
 
     if not hmac.compare_digest(x_webhook_secret, settings.webhook_secret):
+        WEBHOOKS.labels(outcome="invalid_secret").inc()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid webhook secret",
@@ -57,6 +60,8 @@ def handle_domain_event(
     cache_key = f"trust:agent:{payload.agent_id}:conversion"
 
     cache.invalidate(cache_key)
+
+    WEBHOOKS.labels(outcome="received").inc()
 
     logger.info(
         "[Domain Event] Dropped active cache for Agent %s due to %s",

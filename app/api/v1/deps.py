@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.infra.db.session import get_db
 from app.infra.settings import get_settings
+from app.observability.metrics import RATE_LIMIT_REJECTIONS
 from app.security.auth import Principal, get_current_principal
 from app.security.identity import Identity, resolve_identity
 from app.security.rate_limit import (
@@ -92,6 +93,7 @@ def enforce_rate_limit(
         key = f"{key}:{identity.user_id}"
 
     if not limiter.allow(key):
+        RATE_LIMIT_REJECTIONS.inc()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded",

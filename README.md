@@ -470,8 +470,37 @@ version, per-segment recall, last outcome) and `vNNN/model.joblib` + `vNNN/metad
 - [ ] Configure `CORS_ORIGINS` with your React app's domain
 - [ ] Run behind a reverse proxy (nginx, Caddy) for TLS termination
 - [ ] Ensure MySQL credentials are read-only (SELECT only, no INSERT/UPDATE/DELETE outside `agent_score_audits`)
-- [ ] Monitor `/metrics` in your observability stack
+- [x] Monitor `/metrics` in your observability stack
 - [ ] Set up CI/CD via the provided GitHub Actions workflows
+
+## Observability
+
+Prometheus metrics are exposed at `/metrics` (bearer-gated by `METRICS_TOKEN`).
+HTTP and cache series label by **route template** (e.g. `/v1/trust-score/{agent_id}`),
+never raw URLs or query strings; requests that match no route are labeled `unmatched`.
+
+Key series:
+
+- `agent_trust_http_requests_total{status,method,route}` — HTTP volume and errors
+  by route template; `agent_trust_http_duration_seconds` — overall latency.
+- `agent_trust_scoring_duration_ms` — scoring latency (kept for dashboard
+  back-compat; observed in seconds so the default buckets are correct).
+- `agent_trust_requests_total{status}` — legacy service-tone counter (unchanged).
+- `agent_trust_cache_{hits,misses,stale_hits,invalidations,errors}_total` — the
+  two-tier cache. `cache_stale_hits` fires whenever a 24h stale fallback was
+  served because the DB was unavailable or its schema drifted.
+- `agent_trust_database_failures_total`, `agent_trust_schema_drift_total`,
+  `agent_trust_webhooks_total{outcome}`, `agent_trust_ratelimit_rejections_total`.
+- ML Target Programme and training-lifecycle counters (Sprint 5/6, unchanged).
+
+Each HTTP request also emits one structured JSON line on logger
+`agent_trust.access` (fields: `request_id`, `method`, `path`, `status`,
+`duration_ms`). Ordinary service logs are unchanged; access telemetry never
+includes client IPs.
+
+Alert candidates: rising 5xx rate per route, `cache_stale_hits` rate > 0
+(degraded mode), spikes in `webhooks_total{outcome="invalid_secret"}` or
+`ratelimit_rejections_total`, and any `schema_drift_total` increase.
 
 ## Streamlit Dashboard
 

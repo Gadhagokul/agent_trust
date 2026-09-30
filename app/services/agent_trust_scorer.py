@@ -28,6 +28,7 @@ from app.observability.metrics import (
     AGENT_TRUST_DURATION,
     AGENT_TRUST_REQUESTS,
     COMPONENT_UNAVAILABLE,
+    DATABASE_FAILURES,
 )
 from app.services.cache_adapter import CacheAdapter
 
@@ -808,13 +809,16 @@ class AgentTrustScorer:
             )
 
             score_elapsed_ms = (perf_counter() - score_start) * 1000
-            AGENT_TRUST_DURATION.observe(score_elapsed_ms)
+            # Default Prometheus histogram buckets are second-based; the metric
+            # name keeps the legacy _ms suffix for dashboard compatibility.
+            AGENT_TRUST_DURATION.observe(score_elapsed_ms / 1000.0)
             AGENT_TRUST_REQUESTS.labels(status="success").inc()
 
             self.cache.set(cache_key, result.model_dump())
             return result
 
         except (DatabaseUnavailableError, SchemaChangedError) as err:
+            DATABASE_FAILURES.inc()
             AGENT_TRUST_REQUESTS.labels(status="error").inc()
             logger.warning("DB failure -> trying stale cache: %s", err.code)
             stale = self.cache.get_stale(cache_key)

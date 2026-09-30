@@ -12,6 +12,8 @@ import logging
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.observability.metrics import SCHEMA_DRIFT
+
 logger = logging.getLogger(__name__)
 
 # Declare exactly which columns we query — update here if the query changes
@@ -124,5 +126,8 @@ def validate_schema(db: Session) -> dict[str, list[str]]:
             except Exception as exc:
                 logger.error("Schema guard query failed for %s.%s: %s", table, col, exc)
                 missing.setdefault(table, []).append(col)
+
+    if missing:
+        SCHEMA_DRIFT.inc()
 
     return missing
