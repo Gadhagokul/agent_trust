@@ -193,8 +193,10 @@ This service reads from the Laravel-maintained MySQL database. The **required sc
 
 ### Supplier-specific Search-to-Book (L2B) — Sprint 2 (active rule)
 
-The Search-to-Booking component is computed **per supplier** from the existing
-tables only — no new configuration table is consumed.
+Canonical terminology and the settings↔senior-review-term mapping are in
+[`docs/TERMINOLOGY.md`](docs/TERMINOLOGY.md). The Search-to-Booking component is
+computed **per supplier** from the existing tables only — no new configuration
+table is consumed.
 
 - **Site-level benchmarks (senior §10-13):** each active supplier's target is
   `suppliers.minimum_booking / suppliers.search_limit`, read fresh on every score
@@ -224,6 +226,48 @@ tables only — no new configuration table is consumed.
 - **Booking → supplier** link: `bookings.provider` = `suppliers.name`.
 - **Channel** dimension (NDC / GDS) is **not present** in the current schema —
   grouping by channel stays OFF (`l2b_group_by_channel = false`).
+
+### Supplier L2B business rules (formal confirmation, senior review mandatory #2)
+
+Canonical terminology lives in [`docs/TERMINOLOGY.md`](docs/TERMINOLOGY.md) —
+**Supplier L2B** = `searches / bookings` (x:1, higher = worse); **Allowed L2B**
+= `search_limit / minimum_booking` (x:1, a ratio, **never a percentage**);
+**compliance** = observed L2B ≤ allowed L2B.
+
+The supplier L2B limits are **business contracts, not something to be guessed
+from code**. Each supplier's authoritative rule must be formally confirmed
+before its limit affects scoring. The ML/data-science team must **not** invent
+these numbers. V1 sources the allowed L2B from `suppliers.minimum_booking /
+search_limit`; until a supplier's rule is confirmed the vendor stays
+**NULL / NOT_CONFIGURED** and is excluded (`l2b_not_configured_policy =
+"exclude"`) — never assigned an invented ratio.
+
+**Sign-off template (per supplier):**
+
+| Field | Meaning | Example |
+|-------|---------|---------|
+| `supplier` | Supplier code | AEGEAN |
+| `allowed search/book ratio` | `search_limit / minimum_booking` (x:1) | 1000:1 |
+| `channel` | NDC / GDS / all (none defined in V1 => `all`) | all |
+| `effective date` | Rule effective from / to | 2026-01-01 → present |
+| `measurement definition` | Searches = created + reused `access_count`; bookings = confirmed/ticketed | created+reused / confirmed+ticketed |
+| `minimum observation` | `L2B_MIN_SEARCHES_BEFORE_BREACH` analog | 20 searches |
+
+**Outstanding confirmations (business, not yet received):**
+
+| Supplier | Allowed search/book ratio | Channel | Effective date | Measurement definition | Minimum observation | Status |
+|----------|---------------------------|---------|----------------|------------------------|---------------------|--------|
+| AEGEAN | pending | pending | pending | pending | pending | **awaiting confirmation** |
+| VERTEIL | pending | pending | pending | pending | pending | **awaiting confirmation** |
+| GETFARES | pending | pending | pending | pending | pending | **awaiting confirmation** |
+| ONEFLY | pending | pending | pending | pending | pending | **awaiting confirmation** |
+| SABRE | pending | pending | pending | pending | pending | **awaiting confirmation** |
+
+Until confirmed, each supplier is scored only when both `suppliers` columns
+are present and `search_limit > 0`, and undocumented suppliers stay excluded.
+A dedicated `supplier_search_book_ratios` configuration table is a **future
+DB-owner migration** (this service reads the Laravel DB read-only and does not
+create tables); the handoff SQL is not applied in this phase.
 
 ### Authentication & Authorization
 
@@ -334,6 +378,35 @@ Final score = `(Composite × 0.8) + (ML × 0.2)`, capped at 100.
 > contribution is dropped and the final score is the rule composite alone
 > (**§15.1**: `Final = round(Composite)`), never a "re-created today score". When all gates
 > pass the final is `round(Composite × 0.8 + ML × 0.2)`.
+
+### Reliability V1 scope (officially documented, senior review mandatory #1)
+
+V1 uses a **two-component Reliability definition**:
+
+| Component | Weight | Evidence source |
+|-----------|--------|-----------------|
+| `booking_success` | **64.29%** (`0.6429`) | `bookstep_failed` / eligible attempts |
+| `cancellation_quality` | **35.71%** (`0.3571`) | `lifetime_cancelled` / lifetime bookings |
+
+**Why only two components (and why the weights are 64.29/35.71):** the senior
+review's reference split (45/25/15/10/5 — payment reliability, booking success,
+cancel-request rate, refund rate, supplier failure rate) is **not computable in
+V1** because the current schema has no refund data, no supplier-failure
+attribution, no SLA events, and no confirmed failure/cancellation reason field
+(`non_agent_failure_reasons` / `non_agent_cancellation_reasons` are declared
+but unwired — see `app/infra/settings.py:191-197`). V1 therefore scores the two
+components that **do** have evidence, weighted proportionally to their
+configured weights, defined in `reliability_component_weights`
+(`app/infra/settings.py:174-177`) and normalized over the configured sum
+(`agent_trust_scorer.py:337-343`). Every failure and cancellation is currently
+attributed to the agent.
+
+- **Configurable:** weights live in `reliability_component_weights`; any change
+  is a config change, not a code change.
+- **Documented future target:** the full 45/25/15/10/5 definition is the
+  documented V2 target and will be activated **only** when the missing data
+  sources (refunds, supplier-failure attribution, SLA) exist and business
+  signs off the activation.
 
 ### ML Target Proposal (Sprint 5 — business review)
 
