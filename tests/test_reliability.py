@@ -28,6 +28,20 @@ def scorer():
     return AgentTrustScorer()
 
 
+def test_weights_are_exactly_two_dimensions():
+    """Senior review: unavailable dimensions are None, never artificial 100s.
+
+    The shipped weight set must contain exactly the two evidenced sub-components
+    (booking_success, cancellation_quality) and nothing else -- no phantom
+    refund/supplier-failure/SLA dimension may appear with a fabricated 100.
+    """
+    weights = Settings().reliability_component_weights
+    assert set(weights) == {"booking_success", "cancellation_quality"}
+    assert weights["booking_success"] == 0.6429
+    assert weights["cancellation_quality"] == 0.3571
+    assert abs(sum(weights.values()) - 1.0) < 1e-6
+
+
 def _settings(**overrides):
     base = dict(
         reliability_component_weights={

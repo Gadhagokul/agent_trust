@@ -45,6 +45,48 @@ The scorer compares two internal ratios (both inverted, for numerical safety):
 this comparison; the arbitrary internal curve inputs are {searches, bookings,
 target} and the documented anchors below.
 
+**Direction contract:** the business rule and the observed metric are **both**
+expressed as `searches / bookings` (x:1). The implementation's internal
+`bookings / searches` is only a derived inverse used for numerical scoring — it
+is **never** the definition of L2B. Do not read `ratio_s = bookings/searches` as
+"L2B"; it is `1/observed L2B`.
+
+## Scoring curve contract
+
+For a supplier with allowed L2B `A:1` (target_ratio `t = 1/A`), the L2B score
+(`_score_l2b_for_target`, `agent_trust_scorer.py:369-405`) is:
+
+| Observed L2B (searches/bookings) | Internal `ratio_s` (bookings/searches) | Score |
+|-----------------------------------|----------------------------------------|-------|
+| `= allowed` (`A:1`) | `= target` (`t`) | **80** (neutral, at target) |
+| `< allowed` (better) | `> target` | rises **80 → 100**, reaching 100 at `excellent_multiplier × target` |
+| `> allowed` (worse) | `< target` | falls **80 → 0** linearly (below-target ramp toward 0) |
+
+**Worked example (senior review):** allowed searches per booking = **1000 : 1**
+(`search_limit = 1000`, `minimum_booking = 1`, `t = 0.001`):
+
+| Agent | Searches | Bookings | Observed L2B | Result |
+|-------|----------|----------|--------------|--------|
+| equal | 10,000 | 10 | 1000:1 (= allowed) | **80** |
+| better | 10,000 | 20 | 500:1 (< allowed) | **> 80** |
+| worse | 10,000 | 5 | 2000:1 (> allowed) | **< 80** |
+
+Pinned by `tests/test_scorer.py::TestScoreL2bForTarget::test_allowed_l2b_direction_pinned`.
+
+## Supplier aggregation
+
+The L2B component aggregates **configured suppliers only**, weighted by
+**search volume**, never by booking share:
+
+- **Share** = `supplier searches / total configured searches`
+  (`agent_trust_scorer.py:498`, `share = searches / total_searches`).
+- **Unconfigured suppliers** (no `minimum_booking`/`search_limit > 0`) are
+  **excluded** — never assigned an invented ratio (`l2b_not_configured_policy = "exclude"`).
+- **Dominance cap:** any single supplier's share above `l2b_max_supplier_share`
+  (default 0.5) is capped and the excess redistributed proportionally over the
+  remaining suppliers; the final shares are renormalized to sum to 1
+  (`agent_trust_scorer.py:498-516`).
+
 ## Legacy names — map to canonical
 
 | Legacy / ambiguous name | Canonical term |

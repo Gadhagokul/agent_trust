@@ -318,23 +318,13 @@ This is **not required** (the cache auto-expires every 5 minutes) but it keeps s
 
 ### Audit Table
 
-The `agent_score_audits` table must be pre-created in MySQL. This service writes score change records to it.
-
-```sql
-CREATE TABLE agent_score_audits (
-    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-    agent_id    BIGINT NOT NULL,
-    old_score   DECIMAL(5,2),
-    new_score   DECIMAL(5,2),
-    score_delta DECIMAL(5,2),
-    old_tier    VARCHAR(20),
-    new_tier    VARCHAR(20),
-    event_type  VARCHAR(50),
-    metadata    JSON,
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_agent_id (agent_id)
-);
-```
+Score changes are written to an **append-only JSONL audit file**, not MySQL. The
+path is `AUDIT_LOG_PATH` (`app/infra/settings.py:226`, default
+`logs/agent_score_audits.log`), rotation ~10 MiB over 3 generations, reads are
+bounded to the tail (~256 KiB) — see
+`app/infra/db/audit_repository.py`. This is the single source of truth for
+score-change history; the MySQL credentials held by the service are read-only
+(`SELECT` only).
 
 ---
 
@@ -401,8 +391,21 @@ configured weights, defined in `reliability_component_weights`
 (`agent_trust_scorer.py:337-343`). Every failure and cancellation is currently
 attributed to the agent.
 
+The 64.29% / 35.71% values are exactly the senior review's normalization over
+the two **available** dimensions: `booking_success = 45/70` and
+`cancellation_quality = 25/70`, where 70 = 45 + 25 is the total weight that
+exists in V1. The unavailable dimensions (Refund Behaviour, Supplier Failure
+Impact, SLA Adherence) are **absent from the implementation — they are `None`,
+never an artificial score of 100**. When an agent has no booking evidence at
+all, the whole Reliability component is `None` and its 40% weight is
+redistributed over the available components (`_combine_composite`,
+`agent_trust_scorer.py:540`).
+
 - **Configurable:** weights live in `reliability_component_weights`; any change
   is a config change, not a code change.
+- **Unavailable dimensions are `None`, never 100:** only the two evidenced
+  sub-components exist in the weight set — locked by
+  `tests/test_reliability.py::test_weights_are_exactly_two_dimensions`.
 - **Documented future target:** the full 45/25/15/10/5 definition is the
   documented V2 target and will be activated **only** when the missing data
   sources (refunds, supplier-failure attribution, SLA) exist and business
@@ -442,6 +445,18 @@ predicting the probability of a defined future event within a horizon window.
 
 Until both are approved the service ships with `ml_targets = []` and `ml_enabled = false`
 => ML is always `NOT_READY` => `Final = round(Composite)`.
+
+**ML fallback policy (senior review mandatory #9):**
+
+- **Disabled phase (current shipping state):** `ml_targets = []` makes the gate
+  `ml_ready = false` unconditionally, so the calibration layer contributes
+  **nothing** and `Final = round(Composite)` — a non-model proxy is **never**
+  blended into the published score as if it were an ML prediction.
+- **Ready phase (post sign-off):** a genuine model-unavailable condition
+  (artifact missing/corrupt, checksum mismatch, load failure,
+  `ModelUnavailableError`) must read as `NOT_READY` ⇒ the 20% ML share is
+  dropped ⇒ `Final = round(Composite)` (rules only). See
+  `docs/ML_TARGET_SPEC.md` for the activation constraint this implies.
 
 ### Sprint 6 - Automated Training Lifecycle (all ML currently DISABLED)
 
@@ -542,7 +557,7 @@ version, per-segment recall, last outcome) and `vNNN/model.joblib` + `vNNN/metad
 - [ ] Set `APP_ENV=production`
 - [ ] Configure `CORS_ORIGINS` with your React app's domain
 - [ ] Run behind a reverse proxy (nginx, Caddy) for TLS termination
-- [ ] Ensure MySQL credentials are read-only (SELECT only, no INSERT/UPDATE/DELETE outside `agent_score_audits`)
+- [ ] Ensure MySQL credentials are read-only (SELECT only — score changes are audited to the JSONL file, never MySQL)
 - [x] Monitor `/metrics` in your observability stack
 - [ ] Set up CI/CD via the provided GitHub Actions workflows
 

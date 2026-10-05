@@ -429,6 +429,7 @@ class TestDetermineTier:
             (79.9, "Gold"),
             (80.0, "Platinum"),
             (64.9, "Silver"),
+            (65.0, "Gold"),
             (50.0, "Silver"),
             (49.9, "Bronze"),
             (35.0, "Bronze"),
@@ -902,6 +903,24 @@ class TestScoreL2bForTarget:
         # Guards SUM(access_count) semantics: a few accesses must not read as
         # perfect conversion just because the row counts are small.
         assert scorer._score_l2b_for_target({"searches": 5, "bookings": 2}, 0.05) == 85.0
+
+    def test_allowed_l2b_direction_pinned(self, scorer):
+        # Senior review: allowed searches per booking = 1000:1
+        # (search_limit=1000, minimum_booking=1 -> target = 0.001). L2B is
+        # searches/bookings: at target (1000:1) -> 80; better (500:1) -> > 80;
+        # worse (2000:1) -> < 80. Pins the direction so it can never be reversed.
+        target = 0.001
+        equal = scorer._score_l2b_for_target({"searches": 10_000, "bookings": 10}, target)
+        better = scorer._score_l2b_for_target({"searches": 10_000, "bookings": 20}, target)
+        worse = scorer._score_l2b_for_target({"searches": 10_000, "bookings": 5}, target)
+        assert equal == pytest.approx(80.0)
+        assert better > equal
+        assert worse < equal
+
+    def test_zero_bookings_low_volume_neutral_ramp(self, scorer):
+        # Senior review: 10 searches / 0 bookings must NOT read as an instant
+        # breach. Anchor 80 + (base 0 - 80) * min(1, searches/20) = 40.0.
+        assert scorer._score_l2b_for_target({"searches": 10, "bookings": 0}, 0.05) == 40.0
 
 
 class TestComputeSupplierL2bComponent:

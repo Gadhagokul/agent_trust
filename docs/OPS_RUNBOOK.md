@@ -85,6 +85,27 @@ configuration, not code. Changing them changes published scores or enables
 ML behaviour — treat as a controlled change (see §7). The ML Target Programme
 **ships disabled**: with the defaults nothing trains, loads, blends or serves.
 
+### High-Risk thresholds (senior review §8.2)
+
+High Risk is a hard cap, not a re-scoring: when any threshold below is breached
+the overall (and operational) score is **capped at `high_risk_score_cap`** and
+the sentinel tier is returned regardless of the composite score
+(`_check_high_risk` — `agent_trust_scorer.py:157-183`, applied at
+`agent_trust_scorer.py:687-701`).
+
+| Setting | Default | Trigger condition |
+|---|---|---|
+| `credit_max_overdue_ratio` | `50.0` | `current_overdue_ratio > 50%` (overdue / total credit lines) |
+| `credit_max_delay_days` | `60` | `current_max_delay_days > 60` (longest single payment delay) |
+| `credit_max_overdue_count` | `10` | `current_overdue_count >= 10` outstanding past-due invoices |
+| `credit_max_consecutive_overdue_cycles` | `3` | defaulted the last `3` consecutive credit cycles |
+| `credit_overdue_boundary` | `<` | Whether a due-today invoice counts as overdue; only `"<"` (due today NOT yet overdue — recommended) or `"<="` are accepted |
+| `high_risk_score_cap` | `30` | Effective score cap while High Risk |
+
+All are config-only (see §7 — a threshold change is a controlled config change
+that alters published scores). Each breached trigger is recorded in
+`high_risk_reasons` on the result and audit line.
+
 ### Secret generation
 
 Generate each secret once and store it in the deployment's secret manager:

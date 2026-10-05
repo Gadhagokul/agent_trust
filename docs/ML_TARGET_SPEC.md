@@ -66,6 +66,26 @@ write happens, and the live score stays `Final = round(Composite)`
   `severe_reliability` 35 / `l2b_breach` 25) and renormalized over READY
   targets only. Weights validated against the static allowed-target whitelist.
 
+## Fallback policy (model unavailable)
+
+The published score must never treat a non-ML value as an ML prediction:
+
+- **Disabled phase (current):** `ml_targets = []` ⇒ the gate
+  `ml_ready = ml_enabled AND ml_targets AND ml_calibration_score is not None`
+  (`agent_trust_scorer.py:677-679`) is always `false`, so `Final = round(Composite)`.
+  No model, no registry, no blend.
+- **Ready phase (post sign-off):** any model-unavailable condition
+  (`ModelUnavailableError` — artifact missing/corrupt, checksum mismatch, load
+  failure) must read as `NOT_READY` ⇒ the 20% ML share is dropped ⇒
+  `Final = round(Composite)`.
+- **Activation constraint (flag for implementation before enabling):** the
+  current fallback branches swap in `financial_score` on the stub predictor
+  (`agent_trust_scorer.py:658,668`). That is inert today because `ml_targets = []`
+  short-circuits the gate, but it **must be removed/replaced** so that an
+  unavailable model can never contribute a financial-proxy value as the ML share.
+  Activating the programme requires this resolved first — it is NOT part of this
+  disabled-phase change.
+
 ## Sign-off checklist (business/data-science)
 
 - [ ] Approve the target list (and whether each of the three proposals stands).
