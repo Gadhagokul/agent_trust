@@ -86,9 +86,10 @@ Authorization: Bearer <service-token>
     "experience_score": 67.3,
     "search_to_booking_score": 100.0,
     "composite_trust_score": 85.1,
-    "ml_calibration_score": 79.4,
+    "ml_calibration_score": null,
     "overall_score": 84
   },
+  "_note": "ml_calibration_score is null unless ML is enabled, the agent is active, and a model prediction succeeded; overall_score is then rules-only (round(composite_trust_score)).",
   "features": { "...conversion metrics by time window...", "search_activity": { "created": 8, "reused": 4, "searches": 12, "bookings": 3 } },
   "calculated_at": "2026-06-10T11:00:00"
 }
@@ -448,15 +449,22 @@ Until both are approved the service ships with `ml_targets = []` and `ml_enabled
 
 **ML fallback policy (senior review mandatory #9):**
 
-- **Disabled phase (current shipping state):** `ml_targets = []` makes the gate
-  `ml_ready = false` unconditionally, so the calibration layer contributes
+- **Disabled phase (current shipping state):** the gate is checked *before* any
+  inference, so with `ml_targets = []` the calibration layer contributes
   **nothing** and `Final = round(Composite)` — a non-model proxy is **never**
-  blended into the published score as if it were an ML prediction.
+  blended into the published score as if it were an ML prediction. No predictor
+  is even constructed.
+- **No substitute values (implemented in Phase 7):** every unavailable path —
+  gate off, inactive agent, or `ModelUnavailableError` — sets
+  `ml_calibration_score = null` rather than substituting the financial score. The
+  field is nullable for this reason. Counters: `ML_PREDICTIONS` on a successful
+  prediction, `ML_NOT_READY` when not ready, `ML_FALLBACKS` on
+  `ModelUnavailableError`.
 - **Ready phase (post sign-off):** a genuine model-unavailable condition
   (artifact missing/corrupt, checksum mismatch, load failure,
-  `ModelUnavailableError`) must read as `NOT_READY` ⇒ the 20% ML share is
-  dropped ⇒ `Final = round(Composite)` (rules only). See
-  `docs/ML_TARGET_SPEC.md` for the activation constraint this implies.
+  `ModelUnavailableError`) reads as `NOT_READY` ⇒ the 20% ML share is dropped ⇒
+  `Final = round(Composite)` (rules only). `ml_calibration_score` is `null` in
+  that case. See `docs/ML_TARGET_SPEC.md`.
 
 ### Sprint 6 - Automated Training Lifecycle (all ML currently DISABLED)
 
@@ -579,8 +587,15 @@ Key series:
   back-compat; observed in seconds so the default buckets are correct).
 - `agent_trust_requests_total{status}` — legacy service-tone counter (unchanged).
 - `agent_trust_cache_{hits,misses,stale_hits,invalidations,errors}_total` — the
-  two-tier cache. `cache_stale_hits` fires whenever a 24h stale fallback was
-  served because the DB was unavailable or its schema drifted.
+  two-tier cache (Redis-only: 300 s primary, 24 h stale; no in-process tier).
+  `cache_stale_hits` fires whenever a 24h stale fallback was served because the
+  DB was unavailable or its schema drifted. The cache key carries no config
+  fingerprint, so rule/weight changes apply only after TTL expiry or an
+  invalidation — see [`docs/OPS_RUNBOOK.md`](docs/OPS_RUNBOOK.md) §1.
+- `agent_trust_ml_{predictions,not_ready,fallbacks}_total` — ML calibration
+  outcomes. `not_ready` covers the gate being off or an inactive agent;
+  `fallbacks` counts `ModelUnavailableError`. No `financial_score` substitute is
+  ever blended in as a pseudo-prediction.
 - `agent_trust_database_failures_total`, `agent_trust_schema_drift_total`,
   `agent_trust_webhooks_total{outcome}`, `agent_trust_ratelimit_rejections_total`.
 - ML Target Programme and training-lifecycle counters (Sprint 5/6, unchanged).

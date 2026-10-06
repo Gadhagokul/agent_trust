@@ -73,7 +73,10 @@ class AgentTrustScores(BaseModel):
     financial_score: float = Field(default=0.0)
     experience_score: float = Field(default=0.0)
     composite_trust_score: float = Field(default=0.0)
-    ml_calibration_score: float = Field(default=0.0)
+    # None when the ML programme is disabled or the model is unavailable
+    # (NOT_READY). Never a substitute value -- a non-ML score must not occupy
+    # the ML share (senior review #6).
+    ml_calibration_score: float | None = None
     overall_score: int = Field(..., ge=0, le=100)
     # None when the agent has no search behavior data (component excluded)
     search_to_booking_score: float | None = None

@@ -9,6 +9,7 @@ from prometheus_client import REGISTRY
 from app.domain.errors import DatabaseUnavailableError, ModelUnavailableError
 from app.domain.models import AgentTrustResult
 from app.infra.db.repository import CreditStats
+from app.infra.settings import Settings
 from app.ml.trust_model import (
     TRAINING_OUTCOME_PROMOTED,
     TRAINING_OUTCOME_REJECTED,
@@ -111,8 +112,8 @@ def _minimal_result_dict():
             "financial_score": 100.0,
             "experience_score": 0.0,
             "composite_trust_score": 72.0,
-            "ml_calibration_score": 100.0,
-            "overall_score": 78,
+            "ml_calibration_score": None,
+            "overall_score": 72,
             "search_to_booking_score": None,
         },
         "tier": "Gold",
@@ -1203,6 +1204,120 @@ class TestCompositeRenormalization:
         scorer._check_high_risk = counting
         scorer.calculate(db=MagicMock(), agent_id=1)
         assert len(calls) == 1
+
+
+class TestMlGateFallback:
+    """ML must never fall back to a non-ML value (senior review #6).
+
+    An unavailable model is NOT_READY: the 20% ML share is dropped and the
+    published score stays rules-only. A substitute score (the financial score)
+    must never occupy the ML share.
+    """
+
+    def _enabled_settings(self, monkeypatch, **overrides):
+        """Patch in an ML-enabled settings object.
+
+        The real defaults stay ml_enabled=False / ml_targets=[]; this only
+        exercises the enabled branch without touching shipped config.
+        """
+        base = SimpleNamespace(
+            **{
+                **Settings().model_dump(),
+                "ml_enabled": True,
+                "ml_targets": ["severe_default"],
+            }
+        )
+        for key, value in overrides.items():
+            setattr(base, key, value)
+        monkeypatch.setattr(
+            "app.services.agent_trust_scorer.get_settings", lambda: base
+        )
+        return base
+
+    def _scaffold(self, mock_repo_cls, mock_cache_cls, mock_ml_cls):
+        mock_cache = MagicMock()
+        mock_cache_cls.return_value = mock_cache
+        mock_cache.get.return_value = None
+        mock_cache.acquire_lock.return_value = "lock-token"
+
+        mock_repo = MagicMock()
+        mock_repo_cls.return_value = mock_repo
+        mock_repo.get_agent.return_value = (1, "Test Agent")
+        mock_repo.get_credit_stats.return_value = _make_credit_stats()
+        conv_active = {
+            **_minimal_conversion(),
+            "searches": 100,
+            "effective_searches": 100,
+            "bookings": 5,
+            "no_activity": False,
+            "low_confidence": False,
+        }
+        mock_repo.get_multi_timeframe_stats.return_value = {
+            1: conv_active,
+            7: conv_active,
+            30: conv_active,
+            365: {"bookings": 10, "bookstep_failed": 0},
+        }
+        mock_repo.get_experience_stats.return_value = {
+            "created_at": None,
+            "lifetime_bookings": 0,
+            "lifetime_revenue": 0.0,
+            "lifetime_cancelled": 0,
+        }
+        mock_repo.get_agent_search_activity.return_value = {
+            "searches": 100,
+            "created": 80,
+            "reused": 20,
+            "bookings": 20,
+        }
+        mock_repo.get_supplier_l2b_targets.return_value = []
+        mock_repo.get_agent_supplier_searches.return_value = []
+        mock_repo.get_agent_booking_counts_by_provider.return_value = []
+
+        mock_ml = MagicMock()
+        mock_ml_cls.return_value = mock_ml
+        return mock_ml
+
+    @patch("app.services.agent_trust_scorer.AuditRepository")
+    @patch("app.services.agent_trust_scorer.TrustModelPredictor")
+    @patch("app.services.agent_trust_scorer.CacheAdapter")
+    @patch("app.services.agent_trust_scorer.AgentRepository")
+    def test_ml_unavailable_is_not_ready_rules_only(
+        self, mock_repo_cls, mock_cache_cls, mock_ml_cls, mock_audit_cls, monkeypatch
+    ):
+        # Gate ON but no usable model: previously this produced
+        # 80% composite + 20% financial, which is not ML calibration.
+        self._enabled_settings(monkeypatch)
+        mock_ml = self._scaffold(mock_repo_cls, mock_cache_cls, mock_ml_cls)
+        mock_ml.predict.side_effect = ModelUnavailableError("no artifact")
+
+        before = _counter("agent_trust_ml_fallbacks_total")
+        result = AgentTrustScorer().calculate(db=MagicMock(), agent_id=1)
+
+        assert mock_ml.predict.call_count == 1
+        assert result.scores.ml_calibration_score is None
+        # rules-only: overall == round(composite), never a blend
+        assert result.scores.overall_score == round(result.scores.composite_trust_score)
+        assert _counter("agent_trust_ml_fallbacks_total") == before + 1
+
+    @patch("app.services.agent_trust_scorer.AuditRepository")
+    @patch("app.services.agent_trust_scorer.TrustModelPredictor")
+    @patch("app.services.agent_trust_scorer.CacheAdapter")
+    @patch("app.services.agent_trust_scorer.AgentRepository")
+    def test_ml_disabled_never_calls_predictor(
+        self, mock_repo_cls, mock_cache_cls, mock_ml_cls, mock_audit_cls
+    ):
+        # Gate is evaluated BEFORE inference, so a disabled programme does no
+        # ML work at all and reports NOT_READY.
+        mock_ml = self._scaffold(mock_repo_cls, mock_cache_cls, mock_ml_cls)
+
+        before = _counter("agent_trust_ml_not_ready_total")
+        result = AgentTrustScorer().calculate(db=MagicMock(), agent_id=1)
+
+        mock_ml.predict.assert_not_called()
+        assert result.scores.ml_calibration_score is None
+        assert result.scores.overall_score == round(result.scores.composite_trust_score)
+        assert _counter("agent_trust_ml_not_ready_total") == before + 1
 
 
 # ── Sprint 6: Training Controller & automated model lifecycle ─────────────────

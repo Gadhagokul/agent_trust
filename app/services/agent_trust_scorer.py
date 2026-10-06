@@ -29,6 +29,9 @@ from app.observability.metrics import (
     AGENT_TRUST_REQUESTS,
     COMPONENT_UNAVAILABLE,
     DATABASE_FAILURES,
+    ML_FALLBACKS,
+    ML_NOT_READY,
+    ML_PREDICTIONS,
 )
 from app.services.cache_adapter import CacheAdapter
 
@@ -638,46 +641,60 @@ class AgentTrustScorer:
             )
 
             # --- 3. ML Calibration Layer ---
+            # `is_inactive_overall` also feeds features.no_activity below, so it
+            # is derived independently of the ML gate.
             stats_7d = batch_stats.get(7, {})
             stats_30d = batch_stats.get(30, {})
-            ml_features = {
-                "eff_searches_7d": stats_7d.get("effective_searches", 0),
-                "bookings_7d": stats_7d.get("bookings", 0),
-                "eff_searches_30d": stats_30d.get("effective_searches", 0),
-                "bookings_30d": stats_30d.get("bookings", 0),
-                "current_overdue_count": credit_stats.current_overdue_count,
-                "current_overdue_ratio": credit_stats.current_overdue_ratio,
-                "current_max_delay_days": credit_stats.current_max_delay_days,
-            }
-
             is_inactive_overall = (
-                ml_features["eff_searches_7d"] == 0 and ml_features["eff_searches_30d"] == 0
+                stats_7d.get("effective_searches", 0) == 0
+                and stats_30d.get("effective_searches", 0) == 0
             )
 
-            if is_inactive_overall:
-                ml_calibration_score = financial_score
+            # The gate is evaluated BEFORE any inference is attempted, so a
+            # disabled programme costs nothing and can never reach the blend.
+            settings = get_settings()
+            ml_gate_on = bool(settings.ml_enabled and settings.ml_targets)
+            ml_calibration_score: float | None = None
+
+            if not ml_gate_on:
+                ML_NOT_READY.inc()
+            elif is_inactive_overall:
+                # No behavioural evidence to calibrate against. This is NOT READY,
+                # never a substitute score.
+                ML_NOT_READY.inc()
             else:
+                ml_features = {
+                    "eff_searches_7d": stats_7d.get("effective_searches", 0),
+                    "bookings_7d": stats_7d.get("bookings", 0),
+                    "eff_searches_30d": stats_30d.get("effective_searches", 0),
+                    "bookings_30d": stats_30d.get("bookings", 0),
+                    "current_overdue_count": credit_stats.current_overdue_count,
+                    "current_overdue_ratio": credit_stats.current_overdue_ratio,
+                    "current_max_delay_days": credit_stats.current_max_delay_days,
+                }
                 try:
                     predictor = TrustModelPredictor()
                     ml_calibration_score = predictor.predict(ml_features)
+                    ML_PREDICTIONS.inc()
                 except ModelUnavailableError:
+                    # Model unavailable => NOT_READY => rules-only. The ML share
+                    # is dropped; a non-ML value (e.g. the financial score) must
+                    # never occupy it (senior review #6).
                     logger.warning(
-                        "ML model unavailable -- falling back to financial score for agent %s",
+                        "ML model unavailable -- NOT_READY, serving rules-only for agent %s",
                         agent_id,
                     )
-                    ml_calibration_score = financial_score
+                    ml_calibration_score = None
+                    ML_FALLBACKS.inc()
 
             # --- 4. Final Trust Score (Sprint 5 ML gate) ---
             # The ML layer ships DISABLED. Gate logic (senior 15.1):
             #   * if the programme is not configured OR not ready -> the agent's
             #     overall score is round(composite_trust) -- never a blend and
-            #     never a financial-proxy fallback masquerading as ML.
+            #     never a fallback value masquerading as ML.
             #   * only when ready -> 80% composite / 20% combined ML weights.
-            settings = get_settings()
-            ml_ready = bool(
-                settings.ml_enabled and settings.ml_targets and ml_calibration_score is not None
-            )
-            if ml_ready:
+            ml_ready = bool(ml_gate_on and ml_calibration_score is not None)
+            if ml_ready and ml_calibration_score is not None:
                 overall = round((composite_trust * 0.8) + (ml_calibration_score * 0.2))
             else:
                 overall = round(composite_trust)

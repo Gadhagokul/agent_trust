@@ -43,6 +43,16 @@ A domain-event webhook removes **both** tiers in one atomic `DEL`
 state change. All Redis errors are swallowed and logged — the cache can never
 crash the application.
 
+**No in-process tier.** Redis is the only cache; there is no local memory
+layer in front of it.
+
+**Cache key:** `trust:agent:{agent_id}:conversion`. The key does **not** include
+a configuration or scoring-weight fingerprint. A scoring-rule or weight change is
+therefore not visible to the cache by itself — it takes effect only when the
+300 s primary TTL expires or a webhook invalidates the entry. When changing
+weights or scoring rules, either wait out the primary TTL or trigger an
+invalidation; do not assume the new rule applies immediately.
+
 ---
 
 ## 2. Configuration reference

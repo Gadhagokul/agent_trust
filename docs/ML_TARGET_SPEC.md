@@ -72,19 +72,24 @@ The published score must never treat a non-ML value as an ML prediction:
 
 - **Disabled phase (current):** `ml_targets = []` ⇒ the gate
   `ml_ready = ml_enabled AND ml_targets AND ml_calibration_score is not None`
-  (`agent_trust_scorer.py:677-679`) is always `false`, so `Final = round(Composite)`.
-  No model, no registry, no blend.
+  is always `false`, so `Final = round(Composite)`. No model, no registry, no
+  blend — and no inference is even attempted.
 - **Ready phase (post sign-off):** any model-unavailable condition
   (`ModelUnavailableError` — artifact missing/corrupt, checksum mismatch, load
   failure) must read as `NOT_READY` ⇒ the 20% ML share is dropped ⇒
   `Final = round(Composite)`.
-- **Activation constraint (flag for implementation before enabling):** the
-  current fallback branches swap in `financial_score` on the stub predictor
-  (`agent_trust_scorer.py:658,668`). That is inert today because `ml_targets = []`
-  short-circuits the gate, but it **must be removed/replaced** so that an
-  unavailable model can never contribute a financial-proxy value as the ML share.
-  Activating the programme requires this resolved first — it is NOT part of this
-  disabled-phase change.
+- **Implemented (Phase 7):** the gate is now evaluated **before** any inference is
+  attempted, and every unavailable path assigns `ml_calibration_score = None`
+  rather than a substitute value. The previous `financial_score` substitution on
+  the stub predictor and on `ModelUnavailableError` has been **removed**. An
+  inactive agent is likewise `NOT_READY`, not a financial-proxy prediction. With
+  the gate off, no inference is attempted at all, so the disabled phase costs
+  nothing and cannot reach the blend.
+- **Observable:** `ML_PREDICTIONS` on a successful prediction, `ML_NOT_READY`
+  when the gate is off or the agent is inactive, `ML_FALLBACKS` on
+  `ModelUnavailableError`.
+- **ML remains disabled.** `ml_enabled = false` and `ml_targets = []` are
+  unchanged — this phase only makes the system safe for a future activation.
 
 ## Sign-off checklist (business/data-science)
 
